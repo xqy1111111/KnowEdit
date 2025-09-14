@@ -91,9 +91,9 @@ def generate_answer(model, tokenizer, prompt: str,
                     max_new_tokens=128, temperature=0.0, top_p=1.0,
                     reveal_reasoning: bool = False) -> str:
     """
-    对 Instruct/Chat 模型优先走 chat 模板；
-    对 base 模型退化为普通续写。
-    —— 不做“首行即停”等强截断；是否长输出交给调用处的 max_new_tokens 控制。
+    对 Instruct/Chat 模型优先走 chat 模板；对 base 模型退化为普通续写。
+    - 若设置环境变量 USE_VLLM=1，则使用 vLLM 进行生成（需要 pip install vllm）。
+    - 可通过 VLLM_MODEL 指定加载的模型（默认 tokenizer.name_or_path）。
     """
     # 统一 pad_token，消除警告
     if tokenizer.pad_token_id is None:
@@ -115,6 +115,31 @@ def generate_answer(model, tokenizer, prompt: str,
     else:
         # 退化到纯文本
         text = (messages[0]["content"] + "\nQ: " + prompt + "\nA:")
+
+    # 可选：使用 vLLM 加速生成
+    if os.getenv("USE_VLLM", "0") == "1":
+        try:
+            from vllm import LLM, SamplingParams
+            # 缓存/复用引擎（简单全局缓存，按模型名唯一）
+            global _VLLM_ENGINE, _VLLM_MODEL_ID
+            model_id = os.getenv("VLLM_MODEL", getattr(tokenizer, "name_or_path", None) or "")
+            if not model_id:
+                model_id = ""  # 让后续异常触发回退
+            if '_VLLM_ENGINE' not in globals():
+                _VLLM_ENGINE, _VLLM_MODEL_ID = None, None
+            if _VLLM_ENGINE is None or _VLLM_MODEL_ID != model_id:
+                tp = int(os.getenv("VLLM_TP", "1"))
+                _VLLM_ENGINE = LLM(model=model_id, tensor_parallel_size=tp, dtype="bfloat16", trust_remote_code=True)
+                _VLLM_MODEL_ID = model_id
+            # 采样参数
+            stop = [s for s in ["<|im_end|>", "<|end|>"] if s]
+            sp = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_new_tokens, stop=stop)
+            outs = _VLLM_ENGINE.generate([text], sp)
+            ans = outs[0].outputs[0].text
+            return ans.strip()
+        except Exception:
+            # 若 vLLM 不可用或出错，退回 HF generate
+            pass
 
     enc = tokenizer(text, return_tensors="pt").to(model.device)
 
