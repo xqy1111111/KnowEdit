@@ -1,29 +1,33 @@
 # scripts/eval_zsre_singlehop.py
+# -*- coding: utf-8 -*-
 import os, argparse, time, json, re, unicodedata
-from typing import List
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from typing import List, Tuple
 import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
 
-from utils_mquake import (
-    load_mquake_json as load_json,   # 复用你的通用 JSON/JSONL 读取
+from .utils_mquake import (  # 复用你的通用生成与工具
+    load_mquake_json as load_json,
     generate_answer, split_reasoning_final,
     contains_any, sanitize_aliases, normalize_text
 )
 
-# ---------- 规范化 / 模糊匹配，与 MQuAKE 版一致 ----------
+# -------------------- 小工具：规范化 & 模糊匹配 --------------------
 def strip_accents(s: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
 def norm_loose(s: str) -> str:
     s = s or ""
     s = strip_accents(s.lower())
     s = re.sub(r"[\W_]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
+
 try:
     from rapidfuzz.fuzz import partial_ratio, WRatio
     HAVE_RAPID = True
 except Exception:
     HAVE_RAPID = False
+
 def fuzzy_hit(pred: str, golds: List[str], fuzzy_thr: int = 90) -> bool:
     p = norm_loose(pred)
     if not p:
@@ -42,7 +46,7 @@ def fuzzy_hit(pred: str, golds: List[str], fuzzy_thr: int = 90) -> bool:
                 pass
     return False
 
-# ---------- BERTScore（缓存），与 MQuAKE 版一致 ----------
+# -------------------- BERTScore（按需加载） --------------------
 _BERT_SCORER = None
 def get_bertscorer():
     global _BERT_SCORER
@@ -50,7 +54,7 @@ def get_bertscorer():
         try:
             from bert_score import BERTScorer
         except ImportError as e:
-            raise RuntimeError("please: pip install bert-score") from e
+            raise RuntimeError("metric=bert 需安装：pip install bert-score") from e
         _BERT_SCORER = BERTScorer(
             model_type="roberta-large",
             lang="en",
@@ -58,24 +62,44 @@ def get_bertscorer():
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
     return _BERT_SCORER
+
 def bert_hit_cached(pred: str, golds: List[str], thresh: float = 0.85) -> bool:
     scorer = get_bertscorer()
     P, R, F1 = scorer.score([pred] * len(golds), golds)
     best = float(F1.max()) if len(F1) else 0.0
     return best >= thresh
 
-# ---------- LLM-as-Judge，与 MQuAKE 版一致 ----------
-_JUDGE_CACHE = {}
-def get_judge(model_id: str):
-    if model_id in _JUDGE_CACHE:
-        return _JUDGE_CACHE[model_id]
+# -------------------- dtype / 加载模型（无 accelerate 依赖） --------------------
+def pick_dtype() -> torch.dtype:
+    if torch.cuda.is_available():
+        # 新卡优先 bfloat16，不支持就 float16
+        try:
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+        except Exception:
+            pass
+        return torch.float16
+    return torch.float32
+
+def load_tok_mdl(model_id: str) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    # 有的 tokenizer 没有 pad，避免 generate 报 warning
+    if tok.pad_token is None and tok.eos_token is not None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "left"
+
     mdl = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
+        model_id,
+        torch_dtype=pick_dtype(),
+        trust_remote_code=True,
     )
-    _JUDGE_CACHE[model_id] = (tok, mdl)
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    mdl.to(device)
+    mdl.eval()
     return tok, mdl
 
+# -------------------- LLM-as-Judge（同样不依赖 accelerate） --------------------
+_JUDGE_CACHE = {}
 JUDGE_PROMPT = """You are a precise grader.
 Only judge the FINAL_ANSWER string; IGNORE any hidden thoughts/reasoning if present.
 Normalize: lowercase, remove punctuation/accents; minor typos are acceptable.
@@ -89,6 +113,13 @@ FINAL_ANSWER: {final}
 
 Decision (YES or NO):"""
 
+def get_judge(model_id: str):
+    if model_id in _JUDGE_CACHE:
+        return _JUDGE_CACHE[model_id]
+    tok, mdl = load_tok_mdl(model_id)
+    _JUDGE_CACHE[model_id] = (tok, mdl)
+    return tok, mdl
+
 def judge_hit(judge_model_id: str, question: str, final: str, golds: List[str],
               max_new_tokens: int = 8, debug: bool = False) -> bool:
     tok, mdl = get_judge(judge_model_id)
@@ -100,7 +131,7 @@ def judge_hit(judge_model_id: str, question: str, final: str, golds: List[str],
         print(f"[LLM-JUDGE] {txt}")
     return "YES" in txt and "NO" not in txt
 
-# ---------- 读取 ZsRE，统一字段 ----------
+# -------------------- 读取 ZsRE（对齐你当前数据字段） --------------------
 def load_zsre(path, n):
     raw = load_json(path)[:n]
     data = []
@@ -108,11 +139,10 @@ def load_zsre(path, n):
         q = it.get("rephrase") or it.get("rephrase_prompt") or it.get("src") or it.get("prompt") or ""
         data.append({
             "prompt": q,
-            "answer": (it.get("ground_truth") or (it.get("answers",[None])[0])),
+            "answer": (it.get("ground_truth") or (it.get("answers", [None])[0])),
             "new_answer": (it.get("target_new") or it.get("alt") or ""),
         })
     return data
-
 
 def get_golds(item, mode: str) -> List[str]:
     if mode == "new":
@@ -125,12 +155,15 @@ def get_golds(item, mode: str) -> List[str]:
         raise ValueError("gold_mode must be one of {new, orig, both}")
     return [g for g in golds if g]
 
-# ---------- 输出小工具 ----------
-def _norm(s: str) -> str: return re.sub(r"\s+", " ", (s or "").strip())
-def _truncate(s: str, n: int = 160) -> str:
-    s = _norm(s);  return s if len(s) <= n else s[: n - 3] + "..."
+# -------------------- 打印小工具 --------------------
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
-# ---------- 主评测（对齐 MQuAKE） ----------
+def _truncate(s: str, n: int = 160) -> str:
+    s = _norm(s)
+    return s if len(s) <= n else s[: n - 3] + "..."
+
+# -------------------- 主评测流程 --------------------
 def eval_model(
     model_path_or_id: str,
     data_path: str,
@@ -147,17 +180,15 @@ def eval_model(
     metric: str = "string",
     bert_thresh: float = 0.85,
     judge_model: str = "",
-    reasoning_tokens: int = 91912,
-    two_pass_reasoning: bool = True,
+    reasoning_tokens: int = 512,
+    two_pass_reasoning: bool = False,
     fuzzy: bool = True,
     fuzzy_thr: int = 90,
     debug_judge: bool = False,
 ):
     print(f"[INFO] Loading model: {model_path_or_id}")
-    tok = AutoTokenizer.from_pretrained(model_path_or_id, trust_remote_code=True)
-    mdl = AutoModelForCausalLM.from_pretrained(
-        model_path_or_id, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
-    )
+    tok, mdl = load_tok_mdl(model_path_or_id)
+
     if torch.cuda.is_available():
         print(f"[INFO] CUDA devices: {torch.cuda.device_count()} | 0: {torch.cuda.get_device_name(0)}")
     print(f"[INFO] dtype={mdl.dtype}  temp={temperature}  top_p={top_p}")
@@ -180,7 +211,7 @@ def eval_model(
     fw = None
     if save_jsonl:
         path = os.path.abspath(os.path.expanduser(save_jsonl))
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)  # 没有就新建
         fw = open(path, "w", encoding="utf-8")
 
     pbar = tqdm(range(total), ncols=100, desc="Evaluating ZsRE", unit="case")
@@ -198,7 +229,7 @@ def eval_model(
         )
         a_for_score = short_ans
 
-        # 2) 可选：单独跑长推理，只记录
+        # 2) 可选：再跑一遍长推理，仅记录
         final_for_record, reasoning_for_record, raw_long = "", "", ""
         if reveal_reasoning and two_pass_reasoning:
             raw_long = generate_answer(
@@ -212,7 +243,7 @@ def eval_model(
                 ret_final, ret_reasoning = "", ""
             final_for_record, reasoning_for_record = ret_final, ret_reasoning
 
-        # 3) 命中（与 MQuAKE 一致）
+        # 3) 命中判断
         if strict:
             An = normalize_text(a_for_score)
             golds_text = [normalize_text(g) for g in golds if normalize_text(g)]
@@ -238,7 +269,8 @@ def eval_model(
         acc = ok / (i + 1)
         pbar.set_postfix(acc=f"{acc:.3f}")
 
-        if (show_samples and i < show_samples) or ((i+1) % 25 == 0):
+        # 打印样例
+        if (show_samples and i < show_samples) or ((i + 1) % max(1, print_every) == 0):
             print(f"\n[SAMPLE {i+1}] hit={hit}")
             print(f"  Q: {_truncate(q, 200)}")
             print(f"  Short: {_truncate(short_ans, 200)}")
@@ -247,6 +279,7 @@ def eval_model(
                 print(f"  Final:     {_truncate(final_for_record, 200)}")
             print(f"  GOLD(s): {', '.join(golds)}")
 
+        # 写结果
         if fw:
             qa_rec = {"q": q, "short": short_ans}
             if reveal_reasoning:
@@ -257,22 +290,25 @@ def eval_model(
                 "per_q_hits": hit,   # 单问，复用字段名便于通用聚合
                 "golds": golds,
                 "qas": [qa_rec],
-            }, ensure_ascii=False)+"\n")
+            }, ensure_ascii=False) + "\n")
             fw.flush()
 
-    if fw: fw.close()
+    if fw:
+        fw.close()
+
     elapsed = time.time() - start
     print("\n====== SUMMARY (ZsRE) ======")
     print(f"Model: {model_path_or_id}")
     print(f"Cases: {total} | Acc: {ok/total:.3f} ({ok}/{total})")
     print(f"Time: {elapsed:.1f}s | {total/max(1,elapsed):.2f} cases/s")
 
+# -------------------- CLI --------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--data_path", required=True)
     ap.add_argument("--num_cases", type=int, default=200)
-    ap.add_argument("--gold_mode", choices=["orig","new","both"], default="new")
+    ap.add_argument("--gold_mode", choices=["orig", "new", "both"], default="new")
 
     # 生成与显示
     ap.add_argument("--temperature", type=float, default=0.0)
@@ -288,7 +324,7 @@ def main():
     ap.add_argument("--strict", action="store_true")
 
     # 度量方式
-    ap.add_argument("--metric", choices=["string","bert","judge","hybrid"], default="string")
+    ap.add_argument("--metric", choices=["string", "bert", "judge", "hybrid"], default="string")
     ap.add_argument("--bert_thresh", type=float, default=0.85)
     ap.add_argument("--judge_model", type=str, default="")
     ap.add_argument("--fuzzy", action="store_true")
