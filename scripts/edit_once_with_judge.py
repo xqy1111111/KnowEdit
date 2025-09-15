@@ -263,20 +263,28 @@ def run_one_case(
             req["prompt"] = f"{req['prompt']} (Subject: {s})"
             req["subject"] = s
 
+    # 构建编辑器（优先一次性加载，避免重复占显存）
     base_model_id = model_override  # 若为空，后面会从 editor.hparams 取
+    editor = build_editor(alg, hparams, model_override)
+    if not base_model_id:
+        base_model_id = getattr(editor.hparams, "model_name", "")
 
-    # A) （可选）编辑前评测
+    # A) （可选）编辑前评测（尽量直接用已加载的 editor.model 与 editor.tok）
     pred_before, a_for_score_before, rewrite_hit_before = "", "", None
     if eval_before:
-        bm_id = base_model_id if base_model_id else None
-        if bm_id is None:
-            # 先临时构建 editor 只为拿到 hparams.model_name
-            tmp_editor = build_editor(alg, hparams, model_override)
-            bm_id = getattr(tmp_editor.hparams, "model_name", "")
-            del tmp_editor
-        tok0 = AutoTokenizer.from_pretrained(bm_id, trust_remote_code=True)
-        ensure_pad_token(tok0)
-        mdl0 = AutoModelForCausalLM.from_pretrained(bm_id, torch_dtype=pick_dtype(), trust_remote_code=True, device_map="auto")
+        mdl0 = getattr(editor, "model", None)
+        tok0 = _unwrap_tokenizer(getattr(editor, "tok", None))
+        if mdl0 is None or tok0 is None:
+            # 回退到单独加载一次基座模型
+            bm_id = base_model_id
+            tok0 = AutoTokenizer.from_pretrained(bm_id, trust_remote_code=True)
+            ensure_pad_token(tok0)
+            mdl0 = AutoModelForCausalLM.from_pretrained(bm_id, torch_dtype=pick_dtype(), trust_remote_code=True, device_map="auto")
+            need_release = True
+        else:
+            ensure_pad_token(tok0)
+            need_release = False
+
         pred_before = generate_answer(
             mdl0, tok0, req["prompt"],
             max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
@@ -288,23 +296,22 @@ def run_one_case(
         else:
             a_for_score_before = pred_before
         rewrite_hit_before = judge_hit(judge_model, question=req["prompt"], final=a_for_score_before, golds=[req.get("target_new","")])
-        # 释放
-        try:
-            del mdl0; del tok0
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-        except Exception:
-            pass
 
-    # B) 执行编辑（单条）
-    editor = build_editor(alg, hparams, model_override)
-    if not base_model_id:
-        base_model_id = getattr(editor.hparams, "model_name", "")
-    metrics, edited_model, tok_like = editor.edit_requests(requests=[req], sequential_edit=False)
+        # 如有必要释放回退加载的模型
+        if need_release:
+            try:
+                del mdl0; del tok0
+                if torch.cuda.is_available(): torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    # B) 执行编辑（单条）。关键：sequential_edit=True 以保留编辑后的权重供外部生成。
+    metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
     if show_eemetrics:
         print("[EASYEDIT METRICS]", json.dumps(metrics, ensure_ascii=False))
 
-    # C) 用编辑后模型生成
-    tok = _unwrap_tokenizer(tok_like) or AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
+    # C) 用编辑后模型生成（直接复用 editor.tok，保持与训练一致）
+    tok = _unwrap_tokenizer(getattr(editor, "tok", None)) or AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
     ensure_pad_token(tok)
     pred_after = generate_answer(
         edited_model, tok, req["prompt"],
