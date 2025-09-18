@@ -81,7 +81,23 @@ def _parse_max_memory_arg(max_memory: str) -> Optional[Dict[str, Any]]:
         raise ValueError(f"无法解析 gen_max_memory: {exc}") from exc
     if not isinstance(parsed, dict):
         raise ValueError("gen_max_memory JSON 必须是对象，如 {'cuda:0': '20GiB'}")
-    return parsed
+    normalized: Dict[Any, Any] = {}
+    for key, value in parsed.items():
+        new_key = key
+        if isinstance(key, str):
+            stripped = key.strip()
+            lower = stripped.lower()
+            if lower.startswith("cuda:"):
+                stripped = stripped.split(":", 1)[1]
+                lower = stripped.lower()
+            if stripped.isdigit():
+                new_key = int(stripped)
+            elif lower in {"cpu", "mps", "disk"}:
+                new_key = lower
+            else:
+                new_key = stripped
+        normalized[new_key] = value
+    return normalized
 
 
 def _maybe_dispatch_generation_model(model, device_map: Optional[Union[str, Dict[str, Any]]],
