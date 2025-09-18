@@ -9,7 +9,14 @@ from typing import List, Dict, Any, Optional, Tuple, Union
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizerBase
-from easyeditor import BaseEditor, ROMEHyperParams, WISEHyperParams
+from easyeditor import (
+    BaseEditor,
+    ROMEHyperParams,
+    WISEHyperParams,
+    FTHyperParams,
+    LoRAHyperParams,
+    QLoRAHyperParams,
+)
 
 # ===================== 工具 =====================
 def pick_dtype() -> torch.dtype:
@@ -110,19 +117,28 @@ def heuristic_extract_subject(prompt: str) -> str:
     return ""
 
 # ===================== 构建 Editor =====================
+ALG_HP_MAP = {
+    "ROME": (ROMEHyperParams, "ROME"),
+    "WISE": (WISEHyperParams, "WISE"),
+    "FT": (FTHyperParams, "FT"),
+    "LORA": (LoRAHyperParams, "LoRA"),
+    "QLORA": (QLoRAHyperParams, "QLoRA"),
+}
+
+SUPPORTED_ALG_NAMES = [display for _, display in ALG_HP_MAP.values()]
+
+
 def build_editor(alg: str, hparams_path: str, model_name: str) -> BaseEditor:
-    if alg.upper() == "ROME":
-        hp = ROMEHyperParams.from_hparams(hparams_path)
-        if model_name:
-            hp.model_name = model_name
-        return BaseEditor.from_hparams(hp)
-    elif alg.upper() == "WISE":
-        hp = WISEHyperParams.from_hparams(hparams_path)
-        if model_name:
-            hp.model_name = model_name
-        return BaseEditor.from_hparams(hp)
-    else:
-        raise ValueError("alg must be one of {ROME, WISE}")
+    key = alg.upper()
+    if key not in ALG_HP_MAP:
+        supported = ", ".join(SUPPORTED_ALG_NAMES)
+        raise ValueError(f"alg must be one of {{{supported}}}")
+
+    hp_cls, _ = ALG_HP_MAP[key]
+    hp = hp_cls.from_hparams(hparams_path)
+    if model_name:
+        hp.model_name = model_name
+    return BaseEditor.from_hparams(hp)
 
 # ===================== 生成（两种模式） =====================
 def _build_messages(prompt: str, mode: str) -> list:
@@ -371,7 +387,7 @@ def run_one_case(
 # ===================== 主流程（支持 repeat） =====================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--alg", required=True, choices=["ROME","WISE"], help="Editing algorithm")
+    ap.add_argument("--alg", required=True, choices=SUPPORTED_ALG_NAMES, help="Editing algorithm")
     ap.add_argument("--hparams", required=True, help="Path to YAML under hparams/")
     ap.add_argument("--data_path", required=True, help="ZSRE-like JSON path")
     ap.add_argument("--model", default="", help="HF model id/path to override YAML")
