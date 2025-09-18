@@ -119,7 +119,7 @@ class BaseEditor:
                 self.model = AutoModelForCausalLM.from_pretrained(self.model_name,trust_remote_code=True, torch_dtype=torch_dtype if hparams.alg_name not in ['MEND'] else torch.bfloat16, device_map=device_map)
                 self.tok = AutoTokenizer.from_pretrained(self.model_name, eos_token='<|endoftext|>', pad_token='<|endoftext|>',unk_token='<|endoftext|>', trust_remote_code=True)
             elif 'qwen' in self.model_name.lower():
-                self.model = AutoModelForCausalLM.from_pretrained(self.model_name,fp32=False,trust_remote_code=True, **model_kwargs)
+                self.model = AutoModelForCausalLM.from_pretrained(self.model_name,trust_remote_code=True, **model_kwargs)
                 self.tok = AutoTokenizer.from_pretrained(self.model_name, eos_token='<|endoftext|>', pad_token='<|endoftext|>',unk_token='<|endoftext|>', trust_remote_code=True)
             elif 'mistral' in self.model_name.lower():
                 self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)

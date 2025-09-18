@@ -92,7 +92,7 @@ def read_zsre_like(path: str) -> List[Dict[str, Any]]:
         reqs.append(req)
     return reqs
 
-# ===================== 主语兜底（ROME 需要） =====================
+# ===================== 主语 =====================
 _SUBJ_PATTERNS = [
     re.compile(r'(?:did|does|was|is|were|has|have)\s+([A-Z][a-z]+(?: [A-Z][a-z]+){0,6})'),
     re.compile(r'^[Ww]ho (?:is|was)\s+([A-Z][a-z]+(?: [A-Z][a-z]+){0,6})'),
@@ -141,7 +141,7 @@ def _build_messages(prompt: str, mode: str) -> list:
     ]
 
 def generate_answer(model, tokenizer, prompt: str,
-                    max_new_tokens=64, temperature=0.0, top_p=1.0,
+                    max_new_tokens=64, temperature=0.6, top_p=0.95,
                     mode: str = "concise") -> str:
     messages = _build_messages(prompt, mode=mode)
     if hasattr(tokenizer, "apply_chat_template"):
@@ -149,7 +149,7 @@ def generate_answer(model, tokenizer, prompt: str,
     else:
         if mode == "reason":
             text = (
-                "You are a helpful assistant. Think step by step INSIDE <reasoning>...</reasoning>. "
+                "You are a helpful assistant. Think step by step INSIDE <reasoning>...</reasoning>. less but useful steps are appriciated"
                 "Then output ONLY the final short answer INSIDE <final>...</final>.\n"
                 f"Q: {prompt}\nA:"
             )
@@ -217,7 +217,6 @@ If FINAL_ANSWER semantically matches ANY of the GOLD items, answer YES; otherwis
 
 Return exactly one token: YES or NO.
 
-QUESTION: {question}
 GOLD: {golds}
 FINAL_ANSWER: {final}
 
@@ -269,7 +268,7 @@ def run_one_case(
     if not base_model_id:
         base_model_id = getattr(editor.hparams, "model_name", "")
 
-    # A) （可选）编辑前评测（尽量直接用已加载的 editor.model 与 editor.tok）
+    #（可选）编辑前评测（尽量直接用已加载的 editor.model 与 editor.tok）
     pred_before, a_for_score_before, rewrite_hit_before = "", "", None
     if eval_before:
         mdl0 = getattr(editor, "model", None)
@@ -305,12 +304,12 @@ def run_one_case(
             except Exception:
                 pass
 
-    # B) 执行编辑（单条）。关键：sequential_edit=True 以保留编辑后的权重供外部生成。
+    # 执行编辑（单条）。关键：sequential_edit=True 以保留编辑后的权重供外部生成。
     metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
     if show_eemetrics:
         print("[EASYEDIT METRICS]", json.dumps(metrics, ensure_ascii=False))
 
-    # C) 用编辑后模型生成（直接复用 editor.tok，保持与训练一致）
+    # 用编辑后模型生成（直接复用 editor.tok，保持与训练一致）
     tok = _unwrap_tokenizer(getattr(editor, "tok", None)) or AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
     ensure_pad_token(tok)
     pred_after = generate_answer(
@@ -326,7 +325,7 @@ def run_one_case(
 
     rewrite_hit_after = judge_hit(judge_model, question=req["prompt"], final=a_for_score_after, golds=[req.get("target_new","")])
 
-    # D) Locality（若提供）
+    # Locality（若提供）
     loc_rec: Dict[str, Any] = {}
     if isinstance(req.get("locality"), dict) and "nq" in req["locality"]:
         lp = req["locality"]["nq"].get("prompt", "")
@@ -385,7 +384,7 @@ def main():
 
     # 生成控制
     ap.add_argument("--gen_mode", choices=["concise","reason"], default="concise")
-    ap.add_argument("--max_new_tokens", type=int, default=64)
+    ap.add_argument("--max_new_tokens", type=int, default=9192)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top_p", type=float, default=1.0)
 
