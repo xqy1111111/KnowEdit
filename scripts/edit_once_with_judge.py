@@ -50,6 +50,139 @@ def _unwrap_tokenizer(tok_like: Any) -> Optional[PreTrainedTokenizerBase]:
                 return v
     return None
 
+
+def _parse_device_map_arg(device_map: str) -> Optional[Union[str, Dict[str, Any]]]:
+    if not device_map:
+        return None
+    device_map = device_map.strip()
+    if not device_map:
+        return None
+    lowered = device_map.lower()
+    if lowered in {"auto", "balanced", "balanced_low_0", "sequential"}:
+        return lowered
+    try:
+        parsed = json.loads(device_map)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"无法解析 gen_device_map: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("gen_device_map JSON 必须是对象")
+    return parsed
+
+
+def _parse_max_memory_arg(max_memory: str) -> Optional[Dict[str, Any]]:
+    if not max_memory:
+        return None
+    max_memory = max_memory.strip()
+    if not max_memory:
+        return None
+    try:
+        parsed = json.loads(max_memory)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"无法解析 gen_max_memory: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("gen_max_memory JSON 必须是对象，如 {'cuda:0': '20GiB'}")
+    return parsed
+
+
+def _maybe_dispatch_generation_model(model, device_map: Optional[Union[str, Dict[str, Any]]],
+                                     max_memory: Optional[Dict[str, Any]] = None):
+    if device_map is None:
+        return model
+    if not torch.cuda.is_available():
+        warnings.warn("CUDA 不可用，无法执行多卡推理，退回单卡模式。")
+        return model
+    try:
+        from accelerate import dispatch_model
+        from accelerate.utils import infer_auto_device_map, get_balanced_memory
+    except ImportError:
+        warnings.warn("未安装 accelerate，无法启用多卡推理，退回单卡模式。")
+        return model
+
+    current_map = getattr(model, "hf_device_map", None)
+    if isinstance(current_map, dict):
+        gpu_devices = set()
+        for dev in current_map.values():
+            if isinstance(dev, str):
+                if dev not in {"cpu", "disk"}:
+                    gpu_devices.add(dev)
+            elif isinstance(dev, int):
+                gpu_devices.add(f"cuda:{dev}")
+        if len(gpu_devices) > 1:
+            return model  # 已经是多卡
+
+    resolved_map = device_map
+    if isinstance(device_map, str):
+        lowered = device_map.lower()
+        no_split = getattr(model, "_no_split_modules", None)
+        if lowered == "auto":
+            resolved_map = infer_auto_device_map(
+                model,
+                max_memory=max_memory,
+                no_split_module_classes=no_split,
+            )
+        elif lowered == "balanced":
+            balanced_memory = get_balanced_memory(
+                model,
+                max_memory=max_memory,
+                no_split_module_classes=no_split,
+                low_zero=False,
+            )
+            resolved_map = infer_auto_device_map(
+                model,
+                max_memory=balanced_memory,
+                no_split_module_classes=no_split,
+            )
+        elif lowered == "balanced_low_0":
+            balanced_memory = get_balanced_memory(
+                model,
+                max_memory=max_memory,
+                no_split_module_classes=no_split,
+                low_zero=True,
+            )
+            resolved_map = infer_auto_device_map(
+                model,
+                max_memory=balanced_memory,
+                no_split_module_classes=no_split,
+            )
+        elif lowered == "sequential":
+            resolved_map = "sequential"
+        else:
+            warnings.warn(f"未知的 gen_device_map 选项: {device_map}，将忽略多卡配置。")
+            return model
+
+    try:
+        dispatch_model(model, device_map=resolved_map, offload_dir=None)
+    except Exception as exc:
+        warnings.warn(f"多卡分发失败，仍使用单卡。原因: {exc}")
+    return model
+
+
+def _infer_model_device(model) -> torch.device:
+    dev = getattr(model, "device", None)
+    if isinstance(dev, torch.device):
+        return dev
+    if isinstance(dev, str):
+        try:
+            return torch.device(dev)
+        except Exception:
+            pass
+    try:
+        first_param = next(model.parameters())
+        if isinstance(first_param, torch.nn.Parameter):
+            return first_param.device
+    except StopIteration:
+        pass
+    except Exception:
+        pass
+    device_map = getattr(model, "hf_device_map", None)
+    if isinstance(device_map, dict):
+        for value in device_map.values():
+            if isinstance(value, str) and value not in {"cpu", "disk"}:
+                return torch.device(value)
+            if isinstance(value, int):
+                return torch.device(f"cuda:{value}")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # ===================== 读取 ZsRE-like =====================
 def _get_first(x, default=""):
     if x is None:
@@ -174,7 +307,8 @@ def generate_answer(model, tokenizer, prompt: str,
 
     ensure_pad_token(tokenizer)
     enc = tokenizer(text, return_tensors="pt")
-    enc = {k: v.to(model.device) for k, v in enc.items()}
+    target_device = _infer_model_device(model)
+    enc = {k: (v.to(target_device) if hasattr(v, "to") else v) for k, v in enc.items()}
 
     eos_ids = []
     for tok in ["<|im_end|>", "<|end|>", tokenizer.eos_token]:
@@ -262,6 +396,8 @@ def run_one_case(
     top_p: float,
     eval_before: bool = False,
     show_eemetrics: bool = False,
+    gen_device_map: Optional[Union[str, Dict[str, Any]]] = None,
+    gen_max_memory: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
 
     # 0) ROME subject 准备
@@ -324,6 +460,8 @@ def run_one_case(
     metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
     if show_eemetrics:
         print("[EASYEDIT METRICS]", json.dumps(metrics, ensure_ascii=False))
+
+    edited_model = _maybe_dispatch_generation_model(edited_model, gen_device_map, gen_max_memory)
 
     # 用编辑后模型生成（直接复用 editor.tok，保持与训练一致）
     tok = _unwrap_tokenizer(getattr(editor, "tok", None)) or AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
@@ -403,6 +541,8 @@ def main():
     ap.add_argument("--max_new_tokens", type=int, default=9192)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top_p", type=float, default=1.0)
+    ap.add_argument("--gen_device_map", default="", help="多卡推理 device_map 配置，支持 auto/balanced/balanced_low_0/sequential 或 JSON 映射")
+    ap.add_argument("--gen_max_memory", default="", help="多卡推理时传给 accelerate 的 max_memory JSON，例如 '{\"cuda:0\": \"20GiB\", \"cuda:1\": \"20GiB\"}'")
 
     # 评测控制
     ap.add_argument("--eval_before", action="store_true", help="Also judge before editing (to prove effect)")
@@ -413,6 +553,15 @@ def main():
     ap.add_argument("--print_every", type=int, default=1)
 
     args = ap.parse_args()
+
+    try:
+        gen_device_map = _parse_device_map_arg(args.gen_device_map)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    try:
+        gen_max_memory = _parse_max_memory_arg(args.gen_max_memory)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
     all_reqs = read_zsre_like(args.data_path)
     if not all_reqs:
@@ -448,6 +597,8 @@ def main():
                 top_p=args.top_p,
                 eval_before=args.eval_before,
                 show_eemetrics=args.show_eemetrics,
+                gen_device_map=gen_device_map,
+                gen_max_memory=gen_max_memory,
             )
             rec["case_index"] = idx
         except Exception as e:
