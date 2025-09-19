@@ -414,6 +414,7 @@ def run_one_case(
     show_eemetrics: bool = False,
     gen_device_map: Optional[Union[str, Dict[str, Any]]] = None,
     gen_max_memory: Optional[Dict[str, Any]] = None,
+    skip_locality: bool = False,
 ) -> Dict[str, Any]:
 
     # 0) ROME subject 准备
@@ -497,7 +498,7 @@ def run_one_case(
 
     # Locality（若提供）
     loc_rec: Dict[str, Any] = {}
-    if isinstance(req.get("locality"), dict) and "nq" in req["locality"]:
+    if (not skip_locality) and isinstance(req.get("locality"), dict) and "nq" in req["locality"]:
         lp = req["locality"]["nq"].get("prompt", "")
         lg = req["locality"]["nq"].get("ground_truth", "")
         if lp and lg:
@@ -563,6 +564,7 @@ def main():
     # 评测控制
     ap.add_argument("--eval_before", action="store_true", help="Also judge before editing (to prove effect)")
     ap.add_argument("--show_eemetrics", action="store_true")
+    ap.add_argument("--skip_locality", action="store_true", help="Skip locality eval to save time")
 
     # 输出
     ap.add_argument("--save_jsonl", default="", help="Where to append results (JSONL). If empty, just print.")
@@ -615,6 +617,7 @@ def main():
                 show_eemetrics=args.show_eemetrics,
                 gen_device_map=gen_device_map,
                 gen_max_memory=gen_max_memory,
+                skip_locality=args.skip_locality,
             )
             rec["case_index"] = idx
         except Exception as e:
