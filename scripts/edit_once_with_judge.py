@@ -6,6 +6,7 @@ import json
 import argparse
 import warnings
 from typing import List, Dict, Any, Optional, Tuple, Union
+from datetime import timedelta
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizerBase
@@ -199,6 +200,140 @@ def _infer_model_device(model) -> torch.device:
                 return torch.device(f"cuda:{value}")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ===================== DeepSpeed Inference（可选） =====================
+def _hf_device_map_multi_gpu(dm) -> bool:
+    if not isinstance(dm, dict):
+        return False
+    gpu_set = set()
+    for v in dm.values():
+        if isinstance(v, str):
+            if v not in {"cpu", "disk"}:
+                gpu_set.add(v)
+        elif isinstance(v, int):
+            gpu_set.add(f"cuda:{v}")
+    return len(gpu_set) > 1
+
+
+def _maybe_apply_ds_inference(model, use_ds_infer: bool,
+                              ds_dtype: str = "auto",
+                              ds_max_out_tokens: int = 0,
+                              ds_kernel_inject: bool = True):
+    """在单进程/单卡场景下，对模型应用 DeepSpeed Inference kernel injection。
+    - 当模型已通过 accelerate 分到多卡（hf_device_map 含多张 GPU）时跳过，避免冲突。
+    - 当未安装 deepspeed 或 CPU 环境亦跳过。
+    - 仅用于加速 generate，不改变权重数值。
+    """
+    if not use_ds_infer:
+        return model
+    if not torch.cuda.is_available():
+        warnings.warn("use_ds_infer=True 但 CUDA 不可用，跳过 DeepSpeed Inference。")
+        return model
+
+    # 若已经跨多卡分片，避免与 DS 注入冲突
+    dm = getattr(model, "hf_device_map", None)
+    if _hf_device_map_multi_gpu(dm):
+        warnings.warn("检测到模型已跨多卡分片（accelerate device_map）。为避免冲突，将跳过 DeepSpeed kernel injection。")
+        return model
+
+    try:
+        import deepspeed
+    except Exception:
+        warnings.warn("未安装 deepspeed 或导入失败，跳过 DeepSpeed Inference。")
+        return model
+
+    # 解析 dtype
+    if ds_dtype == "bf16":
+        target_dtype = torch.bfloat16
+    elif ds_dtype == "fp16":
+        target_dtype = torch.float16
+    else:
+        # auto：尽量用 bf16，其次 fp16
+        target_dtype = pick_dtype()
+
+    # ensure eval & cache for speed
+    try:
+        model.eval()
+        if getattr(model, "config", None) is not None:
+            setattr(model.config, "use_cache", True)
+    except Exception:
+        pass
+
+    # DeepSpeed kernel injection（单进程 mp_size=1）
+    kw = dict(
+        mp_size=1,
+        dtype=target_dtype,
+        replace_method="auto",
+        replace_with_kernel_inject=bool(ds_kernel_inject),
+    )
+    if isinstance(ds_max_out_tokens, int) and ds_max_out_tokens > 0:
+        # 某些版本支持 max_out_tokens
+        kw["max_out_tokens"] = ds_max_out_tokens
+
+    try:
+        engine = deepspeed.init_inference(model, **kw)
+    except TypeError:
+        # 兼容旧版本（不支持 max_out_tokens）
+        kw.pop("max_out_tokens", None)
+        engine = deepspeed.init_inference(model, **kw)
+    except Exception as exc:
+        warnings.warn(f"DeepSpeed Inference 初始化失败，跳过。原因: {exc}")
+        return model
+
+    wrapped = getattr(engine, "module", None)
+    return wrapped or model
+
+
+def _init_distributed_if_needed(enable: bool) -> Tuple[bool, int, int, int]:
+    """若需要，则初始化分布式环境，返回 (is_distributed, rank, world_size, local_rank)。
+    要使多卡 + DeepSpeed 张量并行生效，请使用 torchrun 启动：
+      torchrun --nproc_per_node=N python scripts/edit_once_with_judge.py ... --use_ds_infer --ds_mp_size N
+    """
+    if not enable:
+        return False, 0, 1, 0
+    try:
+        import torch.distributed as dist
+    except Exception:
+        return False, 0, 1, 0
+
+    if dist.is_initialized():
+        try:
+            rank = dist.get_rank()
+            world = dist.get_world_size()
+        except Exception:
+            rank, world = 0, 1
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.set_device(local_rank)
+        except Exception:
+            pass
+        return world > 1, rank, world, local_rank
+
+    # 尝试初始化
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    try:
+        import torch.distributed as dist
+        dist.init_process_group(backend=backend, timeout=timedelta(seconds=1800))
+    except Exception:
+        try:
+            import deepspeed
+            deepspeed.init_distributed(dist_backend=backend)
+        except Exception:
+            return False, 0, 1, 0
+
+    try:
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+    except Exception:
+        rank, world = 0, 1
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+    except Exception:
+        pass
+    return world > 1, rank, world, local_rank
+
 # ===================== 读取 ZsRE-like =====================
 def _get_first(x, default=""):
     if x is None:
@@ -337,16 +472,18 @@ def generate_answer(model, tokenizer, prompt: str,
     if not eos_ids and tokenizer.eos_token_id is not None:
         eos_ids = [tokenizer.eos_token_id]
 
-    out = model.generate(
-        **enc,
-        max_new_tokens=max_new_tokens,
-        do_sample=(temperature > 0),
-        temperature=temperature,
-        top_p=top_p,
-        eos_token_id=eos_ids[0] if len(eos_ids) == 1 else eos_ids,
-        pad_token_id=tokenizer.pad_token_id,
-        no_repeat_ngram_size=3,
-    )
+    # 推理期禁用 autograd 以节省显存并提速
+    with torch.inference_mode():
+        out = model.generate(
+            **enc,
+            max_new_tokens=max_new_tokens,
+            do_sample=(temperature > 0),
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_ids[0] if len(eos_ids) == 1 else eos_ids,
+            pad_token_id=tokenizer.pad_token_id,
+            no_repeat_ngram_size=3,
+        )
     ans = tokenizer.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
     return ans.strip()
 
@@ -415,6 +552,14 @@ def run_one_case(
     gen_device_map: Optional[Union[str, Dict[str, Any]]] = None,
     gen_max_memory: Optional[Dict[str, Any]] = None,
     skip_locality: bool = False,
+    use_ds_infer: bool = False,
+    ds_dtype: str = "auto",
+    ds_max_out_tokens: int = 0,
+    ds_kernel_inject: bool = True,
+    ds_mp_size: int = 1,
+    dist_rank: int = 0,
+    dist_world_size: int = 1,
+    dist_local_rank: int = 0,
 ) -> Dict[str, Any]:
 
     # 0) ROME subject 准备
@@ -440,45 +585,95 @@ def run_one_case(
     #（可选）编辑前评测（尽量直接用已加载的 editor.model 与 editor.tok）
     pred_before, a_for_score_before, rewrite_hit_before = "", "", None
     if eval_before:
-        mdl0 = getattr(editor, "model", None)
-        tok0 = _unwrap_tokenizer(getattr(editor, "tok", None))
-        if mdl0 is None or tok0 is None:
-            # 回退到单独加载一次基座模型
-            bm_id = base_model_id
-            tok0 = AutoTokenizer.from_pretrained(bm_id, trust_remote_code=True)
-            ensure_pad_token(tok0)
-            mdl0 = AutoModelForCausalLM.from_pretrained(bm_id, torch_dtype=pick_dtype(), trust_remote_code=True, device_map="auto")
-            need_release = True
-        else:
-            ensure_pad_token(tok0)
-            need_release = False
+        if not (use_ds_infer and (ds_mp_size or 0) > 1 and dist_world_size > 1 and dist_rank != 0):
+            mdl0 = getattr(editor, "model", None)
+            tok0 = _unwrap_tokenizer(getattr(editor, "tok", None))
+            if mdl0 is None or tok0 is None:
+                # 回退到单独加载一次基座模型
+                bm_id = base_model_id
+                tok0 = AutoTokenizer.from_pretrained(bm_id, trust_remote_code=True)
+                ensure_pad_token(tok0)
+                mdl0 = AutoModelForCausalLM.from_pretrained(bm_id, torch_dtype=pick_dtype(), trust_remote_code=True, device_map="auto")
+                need_release = True
+            else:
+                ensure_pad_token(tok0)
+                need_release = False
 
-        pred_before = generate_answer(
-            mdl0, tok0, req["prompt"],
-            max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
-            mode=gen_mode
-        )
-        if gen_mode == "reason":
-            final_b, _ = extract_final(pred_before)
-            a_for_score_before = final_b if final_b else pred_before
-        else:
-            a_for_score_before = pred_before
-        rewrite_hit_before = judge_hit(judge_model, question=req["prompt"], final=a_for_score_before, golds=[req.get("target_new","")])
+            pred_before = generate_answer(
+                mdl0, tok0, req["prompt"],
+                max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
+                mode=gen_mode
+            )
+            if gen_mode == "reason":
+                final_b, _ = extract_final(pred_before)
+                a_for_score_before = final_b if final_b else pred_before
+            else:
+                a_for_score_before = pred_before
+            # judge 仅在 rank0 评测输出
+            if dist_rank == 0:
+                rewrite_hit_before = judge_hit(judge_model, question=req["prompt"], final=a_for_score_before, golds=[req.get("target_new","")])
 
-        # 如有必要释放回退加载的模型
-        if need_release:
-            try:
-                del mdl0; del tok0
-                if torch.cuda.is_available(): torch.cuda.empty_cache()
-            except Exception:
-                pass
+            # 如有必要释放回退加载的模型
+            if need_release:
+                try:
+                    del mdl0; del tok0
+                    if torch.cuda.is_available(): torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
     # 执行编辑（单条）。关键：sequential_edit=True 以保留编辑后的权重供外部生成。
     metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
-    if show_eemetrics:
+    if show_eemetrics and dist_rank == 0:
         print("[EASYEDIT METRICS]", json.dumps(metrics, ensure_ascii=False))
+    
+    # 选择推理并行方案
+    use_ds_tensor_parallel = bool(use_ds_infer and (ds_mp_size or 0) > 1 and dist_world_size > 1)
+    if use_ds_tensor_parallel:
+        # 若选择 DS 张量并行，多数情况下不要再用 accelerate 分片
+        if gen_device_map is not None:
+            warnings.warn("已启用 DeepSpeed 张量并行，将忽略 gen_device_map/accelerate 分片。")
+        try:
+            import deepspeed
+        except Exception:
+            warnings.warn("未安装 deepspeed，无法进行多卡 DS 推理，退回单卡/accelerate 模式。")
+            use_ds_tensor_parallel = False
 
-    edited_model = _maybe_dispatch_generation_model(edited_model, gen_device_map, gen_max_memory)
+    if use_ds_tensor_parallel:
+        # 在多进程环境下，每个 rank 都有一份相同的 edited_model，然后做 DS TP 注入。
+        target_dtype = torch.bfloat16 if ds_dtype == "bf16" else (torch.float16 if ds_dtype == "fp16" else pick_dtype())
+        try:
+            import deepspeed
+            engine = deepspeed.init_inference(
+                edited_model,
+                mp_size=dist_world_size,
+                dtype=target_dtype,
+                replace_method="auto",
+                replace_with_kernel_inject=bool(ds_kernel_inject),
+            )
+            edited_model = engine.module
+        except Exception as exc:
+            warnings.warn(f"DeepSpeed 张量并行初始化失败，退回 accelerate/单卡：{exc}")
+            use_ds_tensor_parallel = False
+
+    if not use_ds_tensor_parallel:
+        # 仍然可用 accelerate 多卡分片，或单卡
+        edited_model = _maybe_dispatch_generation_model(edited_model, gen_device_map, gen_max_memory)
+        # 单卡 kernel 注入（若开启）
+        edited_model = _maybe_apply_ds_inference(
+            edited_model,
+            use_ds_infer=use_ds_infer,
+            ds_dtype=ds_dtype,
+            ds_max_out_tokens=ds_max_out_tokens,
+            ds_kernel_inject=ds_kernel_inject,
+        )
+    # 单卡场景可尝试 DeepSpeed kernel injection 进一步加速
+    edited_model = _maybe_apply_ds_inference(
+        edited_model,
+        use_ds_infer=use_ds_infer,
+        ds_dtype=ds_dtype,
+        ds_max_out_tokens=ds_max_out_tokens,
+        ds_kernel_inject=ds_kernel_inject,
+    )
 
     # 用编辑后模型生成（直接复用 editor.tok，保持与训练一致）
     tok = _unwrap_tokenizer(getattr(editor, "tok", None)) or AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
@@ -494,7 +689,7 @@ def run_one_case(
     else:
         a_for_score_after = pred_after
 
-    rewrite_hit_after = judge_hit(judge_model, question=req["prompt"], final=a_for_score_after, golds=[req.get("target_new","")])
+    rewrite_hit_after = judge_hit(judge_model, question=req["prompt"], final=a_for_score_after, golds=[req.get("target_new","")]) if dist_rank == 0 else None
 
     # Locality（若提供）
     loc_rec: Dict[str, Any] = {}
@@ -508,25 +703,26 @@ def run_one_case(
                 mode=gen_mode
             )
             loc_final, _ = extract_final(loc_pred) if gen_mode == "reason" else (loc_pred, "")
-            loc_hit = judge_hit(judge_model, question=lp, final=(loc_final or loc_pred), golds=[lg])
+            loc_hit = judge_hit(judge_model, question=lp, final=(loc_final or loc_pred), golds=[lg]) if dist_rank == 0 else None
             loc_rec = {
                 "loc_prompt": lp,
                 "loc_gold": lg,
                 "pred_loc": loc_pred,
-                "locality_hit": int(loc_hit),
+                "locality_hit": (int(loc_hit) if loc_hit is not None else None),
             }
 
     # E) 组装记录（存在才写）
+    rec_rewrite_hit = int(rewrite_hit_after) if rewrite_hit_after is not None else None
     rec: Dict[str, Any] = {
         "prompt": req["prompt"],
         "target_new": req["target_new"],
         "pred_after": pred_after,
-        "rewrite_hit": int(rewrite_hit_after),
+        "rewrite_hit": rec_rewrite_hit,
         "easyedit_metrics": metrics[0] if isinstance(metrics, list) and metrics else metrics,
     }
     if eval_before:
         rec["pred_before"] = pred_before
-        rec["rewrite_hit_before"] = int(rewrite_hit_before)
+        rec["rewrite_hit_before"] = (int(rewrite_hit_before) if rewrite_hit_before is not None else None)
 
     rec.update(loc_rec)
         # --- MINIMAL PATCH: always provide locality keys to avoid KeyError ---
@@ -560,6 +756,13 @@ def main():
     ap.add_argument("--top_p", type=float, default=1.0)
     ap.add_argument("--gen_device_map", default="", help="多卡推理 device_map 配置，支持 auto/balanced/balanced_low_0/sequential 或 JSON 映射")
     ap.add_argument("--gen_max_memory", default="", help="多卡推理时传给 accelerate 的 max_memory JSON，例如 '{\"cuda:0\": \"20GiB\", \"cuda:1\": \"20GiB\"}'")
+    # DeepSpeed Inference（单卡 kernel injection）
+    ap.add_argument("--use_ds_infer", action="store_true", help="编辑后生成阶段启用 DeepSpeed Inference kernel injection（单进程/单卡优先）")
+    ap.add_argument("--ds_dtype", choices=["auto","bf16","fp16"], default="auto", help="DeepSpeed Inference 计算精度")
+    ap.add_argument("--ds_max_out_tokens", type=int, default=0, help="DeepSpeed 预分配最大输出 token 数（>0 启用，可减少动态再分配开销）")
+    ap.add_argument("--no_ds_kernel_inject", dest="ds_kernel_inject", action="store_false", help="关闭 DeepSpeed kernel injection，仅做空包装")
+    ap.set_defaults(ds_kernel_inject=True)
+    ap.add_argument("--ds_mp_size", type=int, default=1, help="DeepSpeed 张量并行大小（>1 需配合 torchrun 多进程启动）")
 
     # 评测控制
     ap.add_argument("--eval_before", action="store_true", help="Also judge before editing (to prove effect)")
@@ -572,6 +775,14 @@ def main():
 
     args = ap.parse_args()
 
+    # 速度小优化：如支持则启用 TF32（对大多数 A100/RTX40 有收益）
+    try:
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
+
     try:
         gen_device_map = _parse_device_map_arg(args.gen_device_map)
     except ValueError as exc:
@@ -580,6 +791,13 @@ def main():
         gen_max_memory = _parse_max_memory_arg(args.gen_max_memory)
     except ValueError as exc:
         raise SystemExit(str(exc))
+
+    # 若用户要求 DeepSpeed 多卡推理，则尝试初始化分布式
+    is_dist, dist_rank, dist_world, dist_local = _init_distributed_if_needed(
+        enable=bool(args.use_ds_infer and (args.ds_mp_size or 0) > 1)
+    )
+    if args.use_ds_infer and (args.ds_mp_size or 0) > 1 and not is_dist:
+        warnings.warn("要求 ds_mp_size>1 但未检测到分布式环境（需 torchrun 启动），将退回单进程模式。")
 
     all_reqs = read_zsre_like(args.data_path)
     if not all_reqs:
@@ -618,17 +836,27 @@ def main():
                 gen_device_map=gen_device_map,
                 gen_max_memory=gen_max_memory,
                 skip_locality=args.skip_locality,
+                use_ds_infer=args.use_ds_infer,
+                ds_dtype=args.ds_dtype,
+                ds_max_out_tokens=args.ds_max_out_tokens,
+                ds_kernel_inject=args.ds_kernel_inject,
+                ds_mp_size=args.ds_mp_size,
+                dist_rank=dist_rank,
+                dist_world_size=dist_world,
+                dist_local_rank=dist_local,
             )
             rec["case_index"] = idx
         except Exception as e:
             rec = {"case_index": idx, "error": str(e)}
             warnings.warn(f"[WARN] case {idx} failed: {e}")
 
-        if fw:
-            fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            fw.flush()
-        if (t + 1) % max(1, args.print_every) == 0 or not fw:
-            print(json.dumps(rec, ensure_ascii=False))
+        # 仅在 rank0 打印/写文件，避免多进程重复输出
+        if (not is_dist) or dist_rank == 0:
+            if fw:
+                fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                fw.flush()
+            if (t + 1) % max(1, args.print_every) == 0 or not fw:
+                print(json.dumps(rec, ensure_ascii=False))
 
         # 显存清理（当前循环结束）
         try:
