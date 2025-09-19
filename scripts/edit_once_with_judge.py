@@ -19,6 +19,15 @@ from easyeditor import (
     QLoRAHyperParams,
 )
 
+# Improve CUDA memory fragmentation resilience unless user overrides.
+# Effective as long as set before first CUDA allocation.
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+
+# Optional judge placement controls (set in main)
+JUDGE_DEVICE_MAP: Optional[Union[str, Dict[str, Any]]] = None
+JUDGE_MAX_MEMORY: Optional[Dict[str, Any]] = None
+
 # ===================== 工具 =====================
 def pick_dtype() -> torch.dtype:
     if torch.cuda.is_available():
@@ -433,6 +442,16 @@ def build_editor(alg: str, hparams_path: str, model_name: str) -> BaseEditor:
     hp = hp_cls.from_hparams(hparams_path)
     if model_name:
         hp.model_name = model_name
+    # Under torchrun multi-process, avoid pinning all editors to one GPU.
+    # If not using model_parallel editing, set device to local_rank.
+    try:
+        world = int(os.environ.get("WORLD_SIZE", "1"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if world > 1 and hasattr(hp, "model_parallel") and not getattr(hp, "model_parallel", False):
+            if torch.cuda.is_available():
+                hp.device = int(local_rank)
+    except Exception:
+        pass
     return BaseEditor.from_hparams(hp)
 
 # ===================== 生成（两种模式） =====================
@@ -517,10 +536,23 @@ def load_judge(model_id: str) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
         return _JUDGE_CACHE[model_id]
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     ensure_pad_token(tok)
-    mdl = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=pick_dtype(),
-        trust_remote_code=True, device_map="auto"
-    )
+    # Respect optional judge placement controls; default to 'auto' if unset.
+    dm = JUDGE_DEVICE_MAP if JUDGE_DEVICE_MAP is not None else "auto"
+    try:
+        mdl = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=pick_dtype(),
+            trust_remote_code=True,
+            device_map=dm,
+            max_memory=JUDGE_MAX_MEMORY,
+        )
+    except Exception as exc:
+        warnings.warn(f"加载裁判模型时多卡/内存配置失败，将退回单设备：{exc}")
+        mdl = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=pick_dtype(),
+            trust_remote_code=True,
+        )
     _JUDGE_CACHE[model_id] = (tok, mdl)
     return tok, mdl
 
@@ -604,7 +636,13 @@ def run_one_case(
                 bm_id = base_model_id
                 tok0 = AutoTokenizer.from_pretrained(bm_id, trust_remote_code=True)
                 ensure_pad_token(tok0)
-                mdl0 = AutoModelForCausalLM.from_pretrained(bm_id, torch_dtype=pick_dtype(), trust_remote_code=True, device_map="auto")
+                mdl0 = AutoModelForCausalLM.from_pretrained(
+                    bm_id,
+                    torch_dtype=pick_dtype(),
+                    trust_remote_code=True,
+                    device_map=(gen_device_map if gen_device_map else "auto"),
+                    max_memory=gen_max_memory,
+                )
                 need_release = True
             else:
                 ensure_pad_token(tok0)
@@ -758,8 +796,11 @@ def main():
     ap.add_argument("--max_new_tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top_p", type=float, default=1.0)
-    ap.add_argument("--gen_device_map", default="", help="多卡推理 device_map 配置，支持 auto/balanced/balanced_low_0/sequential 或 JSON 映射")
+    ap.add_argument("--gen_device_map", default="auto", help="多卡推理 device_map 配置，支持 auto/balanced/balanced_low_0/sequential 或 JSON 映射")
     ap.add_argument("--gen_max_memory", default="", help="多卡推理时传给 accelerate 的 max_memory JSON，例如 '{\"cuda:0\": \"20GiB\", \"cuda:1\": \"20GiB\"}'")
+    # Judge placement
+    ap.add_argument("--judge_device_map", default="auto", help="裁判模型多卡 device_map（auto/… 或 JSON），默认 auto")
+    ap.add_argument("--judge_max_memory", default="", help="裁判模型 max_memory JSON，如 '{\"cuda:2\": \"20GiB\", \"cuda:3\": \"20GiB\"}'")
     # DeepSpeed Inference（单卡 kernel injection）
     ap.add_argument("--use_ds_infer", action="store_true", help="编辑后生成阶段启用 DeepSpeed Inference kernel injection（单进程/单卡优先）")
     ap.add_argument("--ds_dtype", choices=["auto","bf16","fp16"], default="auto", help="DeepSpeed Inference 计算精度")
@@ -795,6 +836,33 @@ def main():
         gen_max_memory = _parse_max_memory_arg(args.gen_max_memory)
     except ValueError as exc:
         raise SystemExit(str(exc))
+    try:
+        judge_device_map = _parse_device_map_arg(args.judge_device_map)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    try:
+        judge_max_memory = _parse_max_memory_arg(args.judge_max_memory)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+
+    # Stash judge placement knobs for load_judge()
+    global JUDGE_DEVICE_MAP, JUDGE_MAX_MEMORY
+    JUDGE_DEVICE_MAP = judge_device_map
+    JUDGE_MAX_MEMORY = judge_max_memory
+
+    # If user didn't provide max_memory and has multi-GPU, derive a safe default for gen.
+    if gen_device_map and isinstance(gen_device_map, str) and gen_device_map in {"auto","balanced","balanced_low_0"}:
+        if not gen_max_memory and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            try:
+                mm = {}
+                for i in range(torch.cuda.device_count()):
+                    free, total = torch.cuda.mem_get_info(i)
+                    # leave ~10% headroom; use total for stable cap
+                    cap_gib = max(1, int((total / (1024**3)) * 0.9))
+                    mm[i] = f"{cap_gib}GiB"
+                gen_max_memory = mm
+            except Exception:
+                pass
 
     # 若用户要求 DeepSpeed 多卡推理，则尝试初始化分布式
     is_dist, dist_rank, dist_world, dist_local = _init_distributed_if_needed(
