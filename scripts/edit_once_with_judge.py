@@ -225,6 +225,12 @@ def _maybe_apply_ds_inference(model, use_ds_infer: bool,
     """
     if not use_ds_infer:
         return model
+    # 避免重复注入导致显存翻倍
+    try:
+        if getattr(model, "_ds_infer_injected", False):
+            return model
+    except Exception:
+        pass
     if not torch.cuda.is_available():
         warnings.warn("use_ds_infer=True 但 CUDA 不可用，跳过 DeepSpeed Inference。")
         return model
@@ -280,7 +286,12 @@ def _maybe_apply_ds_inference(model, use_ds_infer: bool,
         return model
 
     wrapped = getattr(engine, "module", None)
-    return wrapped or model
+    result = wrapped or model
+    try:
+        setattr(result, "_ds_infer_injected", True)
+    except Exception:
+        pass
+    return result
 
 
 def _init_distributed_if_needed(enable: bool) -> Tuple[bool, int, int, int]:
@@ -666,14 +677,7 @@ def run_one_case(
             ds_max_out_tokens=ds_max_out_tokens,
             ds_kernel_inject=ds_kernel_inject,
         )
-    # 单卡场景可尝试 DeepSpeed kernel injection 进一步加速
-    edited_model = _maybe_apply_ds_inference(
-        edited_model,
-        use_ds_infer=use_ds_infer,
-        ds_dtype=ds_dtype,
-        ds_max_out_tokens=ds_max_out_tokens,
-        ds_kernel_inject=ds_kernel_inject,
-    )
+    # 这里不再重复注入 DeepSpeed，避免显存重复占用
 
     # 用编辑后模型生成（直接复用 editor.tok，保持与训练一致）
     tok = _unwrap_tokenizer(getattr(editor, "tok", None)) or AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
@@ -751,7 +755,7 @@ def main():
 
     # 生成控制
     ap.add_argument("--gen_mode", choices=["concise","reason"], default="concise")
-    ap.add_argument("--max_new_tokens", type=int, default=9192)
+    ap.add_argument("--max_new_tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top_p", type=float, default=1.0)
     ap.add_argument("--gen_device_map", default="", help="多卡推理 device_map 配置，支持 auto/balanced/balanced_low_0/sequential 或 JSON 映射")
