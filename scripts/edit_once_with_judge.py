@@ -499,8 +499,12 @@ def _build_messages(prompt: str, mode: str) -> list:
             "Then output ONLY the final short answer INSIDE <final>...</final>. "
             "Do not include anything else outside these tags."
         )
-    else:
+    elif mode == "concise":
         sys_msg = "Answer with a short noun phrase only. Do NOT explain."
+    else:  # "noprompt": 仅用户消息，不注入系统提示
+        return [
+            {"role": "user", "content": prompt}
+        ]
     return [
         {"role": "system", "content": sys_msg},
         {"role": "user",   "content": prompt}
@@ -509,18 +513,22 @@ def _build_messages(prompt: str, mode: str) -> list:
 def generate_answer(model, tokenizer, prompt: str,
                     max_new_tokens=64, temperature=0.6, top_p=0.95,
                     mode: str = "concise") -> str:
-    messages = _build_messages(prompt, mode=mode)
-    if hasattr(tokenizer, "apply_chat_template"):
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    # "noprompt": 完全不注入系统提示，也不使用 chat template，直接把原始问题作为输入
+    if mode == "noprompt":
+        text = prompt
     else:
-        if mode == "reason":
-            text = (
-                "You are a helpful assistant. Think step by step INSIDE <reasoning>...</reasoning>. less but useful steps are appriciated"
-                "Then output ONLY the final short answer INSIDE <final>...</final>.\n"
-                f"Q: {prompt}\nA:"
-            )
+        messages = _build_messages(prompt, mode=mode)
+        if hasattr(tokenizer, "apply_chat_template"):
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         else:
-            text = f"Answer with a short noun phrase only. Do NOT explain.\nQ: {prompt}\nA:"
+            if mode == "reason":
+                text = (
+                    "You are a helpful assistant. Think step by step INSIDE <reasoning>...</reasoning>. less but useful steps are appriciated"
+                    "Then output ONLY the final short answer INSIDE <final>...</final>.\n"
+                    f"Q: {prompt}\nA:"
+                )
+            else:  # concise
+                text = f"Answer with a short noun phrase only. Do NOT explain.\nQ: {prompt}\nA:"
 
     ensure_pad_token(tokenizer)
     enc = tokenizer(text, return_tensors="pt")
@@ -885,7 +893,7 @@ def main():
     ap.add_argument("--judge_model", required=True, help="HF id/path for LLM Judge")
 
     # 生成控制
-    ap.add_argument("--gen_mode", choices=["concise","reason"], default="concise")
+    ap.add_argument("--gen_mode", choices=["concise","reason","noprompt"], default="concise")
     ap.add_argument("--max_new_tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top_p", type=float, default=1.0)
