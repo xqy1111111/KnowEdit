@@ -454,6 +454,7 @@ def heuristic_extract_subject(prompt: str) -> str:
     if caps:
         caps.sort(key=len, reverse=True)
         return caps[0].strip()
+    print("[WARN] 无法从 prompt 中提取主语")
     return ""
 
 # ===================== 构建 Editor =====================
@@ -693,6 +694,26 @@ def run_one_case(
                 req = dict(req)
                 req["prompt"] = f"{req['prompt']} (Subject: {s})"
                 req["subject"] = s
+
+        # For WISE, ensure 'loc_prompt' exists and matches a substring in prompt.
+        # This string is used to locate the subject span for activation masks.
+        if alg.upper() == "WISE":
+            if not isinstance(req, dict):
+                req = dict(req)
+            if not req.get("loc_prompt"):
+                prompt_text = req.get("prompt", "")
+                subj = req.get("subject", "") or heuristic_extract_subject(prompt_text)
+                chosen = subj or prompt_text
+                # Try to pick the exact substring as it appears in prompt (case-insensitive match)
+                if prompt_text and subj:
+                    try:
+                        import re as _re
+                        m = _re.search(_re.escape(subj), prompt_text, flags=_re.IGNORECASE)
+                        if m:
+                            chosen = prompt_text[m.start():m.end()]
+                    except Exception:
+                        pass
+                req["loc_prompt"] = chosen
 
         base_model_id = model_override
         editor = build_editor(alg, hparams, model_override)
