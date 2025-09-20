@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 import os
 import re
+import gc
 import json
+import copy
 import argparse
 import warnings
 from typing import List, Dict, Any, Optional, Tuple, Union
@@ -27,6 +29,58 @@ if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
 # Optional judge placement controls (set in main)
 JUDGE_DEVICE_MAP: Optional[Union[str, Dict[str, Any]]] = None
 JUDGE_MAX_MEMORY: Optional[Dict[str, Any]] = None
+
+# Judge/device management toggles (tweaked via CLI in main)
+DEFAULT_MIN_FREE_GPU_GIB = 3.0
+FORCE_CPU_JUDGE = False
+JUDGE_CACHE_ENABLED = True
+MIN_FREE_GPU_GIB = DEFAULT_MIN_FREE_GPU_GIB
+
+
+def _clear_cuda_cache():
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _is_cpu_device_map(device_map: Optional[Union[str, Dict[str, Any]]]) -> bool:
+    if device_map is None:
+        return False
+    if isinstance(device_map, str):
+        return device_map.lower() == "cpu"
+    if isinstance(device_map, dict):
+        return all(
+            (isinstance(v, str) and v.lower() in {"cpu", "disk"})
+            or (isinstance(v, int) and v < 0)
+            for v in device_map.values()
+        )
+    return False
+
+
+def _should_force_cpu_for_judge(user_device_map: Optional[Union[str, Dict[str, Any]]]) -> bool:
+    if FORCE_CPU_JUDGE:
+        return True
+    if user_device_map is not None and not (
+        isinstance(user_device_map, str) and user_device_map.lower() in {"", "auto", "balanced", "balanced_low_0", "sequential"}
+    ):
+        # User provided explicit mapping; respect it.
+        return False
+    if not torch.cuda.is_available():
+        return True
+    if MIN_FREE_GPU_GIB <= 0:
+        return False
+    try:
+        free_bytes, _total_bytes = torch.cuda.mem_get_info()
+        free_gib = free_bytes / (1024 ** 3)
+    except Exception:
+        return False
+    return free_gib < MIN_FREE_GPU_GIB
 
 # ===================== 工具 =====================
 def pick_dtype() -> torch.dtype:
@@ -532,29 +586,73 @@ def extract_final(text: str) -> Tuple[str, str]:
 # ===================== LLM-Judge =====================
 _JUDGE_CACHE = {}
 def load_judge(model_id: str) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
-    if model_id in _JUDGE_CACHE:
+    if JUDGE_CACHE_ENABLED and model_id in _JUDGE_CACHE:
         return _JUDGE_CACHE[model_id]
+
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     ensure_pad_token(tok)
+
     # Respect optional judge placement controls; default to 'auto' if unset.
-    dm = JUDGE_DEVICE_MAP if JUDGE_DEVICE_MAP is not None else "auto"
+    user_dm = JUDGE_DEVICE_MAP if JUDGE_DEVICE_MAP is not None else "auto"
+    force_cpu = _should_force_cpu_for_judge(user_dm)
+    resolved_dm: Optional[Union[str, Dict[str, Any]]] = "cpu" if force_cpu else user_dm
+    cpu_target = _is_cpu_device_map(resolved_dm)
+
+    def _load(resolved_map, dtype, max_mem=None, low_cpu=False):
+        kwargs = dict(torch_dtype=dtype, trust_remote_code=True)
+        if resolved_map is not None:
+            kwargs["device_map"] = resolved_map
+        if max_mem is not None:
+            kwargs["max_memory"] = max_mem
+        if low_cpu:
+            kwargs["low_cpu_mem_usage"] = True
+        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+
+    dtype = torch.float32 if cpu_target else pick_dtype()
+    max_mem = None if cpu_target else JUDGE_MAX_MEMORY
+
     try:
-        mdl = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=pick_dtype(),
-            trust_remote_code=True,
-            device_map=dm,
-            max_memory=JUDGE_MAX_MEMORY,
-        )
+        mdl = _load(resolved_dm, dtype, max_mem=max_mem, low_cpu=cpu_target)
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        if not cpu_target and ("cuda out of memory" in msg or "cublas" in msg or "mmalloc" in msg):
+            warnings.warn("裁判模型加载触发显存不足，将退回 CPU 运行。")
+            dtype = torch.float32
+            mdl = _load("cpu", dtype, max_mem=None, low_cpu=True)
+            cpu_target = True
+            resolved_dm = "cpu"
+        else:
+            raise
     except Exception as exc:
         warnings.warn(f"加载裁判模型时多卡/内存配置失败，将退回单设备：{exc}")
-        mdl = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=pick_dtype(),
-            trust_remote_code=True,
-        )
-    _JUDGE_CACHE[model_id] = (tok, mdl)
+        dtype = torch.float32 if force_cpu else pick_dtype()
+        fallback_dm = "cpu" if force_cpu else None
+        mdl = _load(fallback_dm, dtype, max_mem=None if fallback_dm == "cpu" else JUDGE_MAX_MEMORY, low_cpu=(fallback_dm == "cpu"))
+
+    if JUDGE_CACHE_ENABLED:
+        _JUDGE_CACHE[model_id] = (tok, mdl)
     return tok, mdl
+
+
+def release_judge(model_id: Optional[str] = None) -> None:
+    if model_id is not None:
+        entries = [model_id]
+    else:
+        entries = list(_JUDGE_CACHE.keys())
+    for mid in entries:
+        pair = _JUDGE_CACHE.pop(mid, None)
+        if pair is None:
+            continue
+        tok, mdl = pair
+        try:
+            del tok
+        except Exception:
+            pass
+        try:
+            del mdl
+        except Exception:
+            pass
+    _clear_cuda_cache()
 
 JUDGE_PROMPT = """You are a precise grader.
 Only judge the FINAL_ANSWER string; ignore any hidden thoughts/reasoning if present.
@@ -774,6 +872,19 @@ def run_one_case(
     rec.setdefault("locality_hit", None)
     # ---------------------------------------------------------------------
 
+    # 资源清理，避免多次 case 叠加显存/内存
+    try:
+        del edited_model
+    except Exception:
+        pass
+    try:
+        del editor
+    except Exception:
+        pass
+    if not JUDGE_CACHE_ENABLED:
+        release_judge(judge_model)
+    _clear_cuda_cache()
+
     return rec
 
 
@@ -801,6 +912,12 @@ def main():
     # Judge placement
     ap.add_argument("--judge_device_map", default="auto", help="裁判模型多卡 device_map（auto/… 或 JSON），默认 auto")
     ap.add_argument("--judge_max_memory", default="", help="裁判模型 max_memory JSON，如 '{\"cuda:2\": \"20GiB\", \"cuda:3\": \"20GiB\"}'")
+    ap.add_argument("--force_cpu_judge", action="store_true", help="强制裁判模型在 CPU 上运行，避免与编辑模型争抢显存")
+    ap.add_argument("--min_free_gpu_gib", type=float, default=DEFAULT_MIN_FREE_GPU_GIB,
+                    help="当检测到可用显存低于该阈值 (GiB) 时，自动将裁判模型回退到 CPU；设为 <=0 可关闭自动回退")
+    ap.add_argument("--no_judge_cache", dest="judge_cache", action="store_false",
+                    help="每条 case 结束后释放裁判模型，减少持续显存占用（会重复加载，略慢）")
+    ap.set_defaults(judge_cache=True)
     # DeepSpeed Inference（单卡 kernel injection）
     ap.add_argument("--use_ds_infer", action="store_true", help="编辑后生成阶段启用 DeepSpeed Inference kernel injection（单进程/单卡优先）")
     ap.add_argument("--ds_dtype", choices=["auto","bf16","fp16"], default="auto", help="DeepSpeed Inference 计算精度")
@@ -846,9 +963,12 @@ def main():
         raise SystemExit(str(exc))
 
     # Stash judge placement knobs for load_judge()
-    global JUDGE_DEVICE_MAP, JUDGE_MAX_MEMORY
+    global JUDGE_DEVICE_MAP, JUDGE_MAX_MEMORY, FORCE_CPU_JUDGE, JUDGE_CACHE_ENABLED, MIN_FREE_GPU_GIB
     JUDGE_DEVICE_MAP = judge_device_map
     JUDGE_MAX_MEMORY = judge_max_memory
+    FORCE_CPU_JUDGE = bool(args.force_cpu_judge)
+    JUDGE_CACHE_ENABLED = bool(args.judge_cache)
+    MIN_FREE_GPU_GIB = float(args.min_free_gpu_gib)
 
     # If user didn't provide max_memory and has multi-GPU, derive a safe default for gen.
     if gen_device_map and isinstance(gen_device_map, str) and gen_device_map in {"auto","balanced","balanced_low_0"}:
@@ -891,7 +1011,7 @@ def main():
             else:
                 break
 
-        req = dict(all_reqs[idx])
+        req = copy.deepcopy(all_reqs[idx])
         try:
             rec = run_one_case(
                 req=req,
@@ -931,11 +1051,7 @@ def main():
                 print(json.dumps(rec, ensure_ascii=False))
 
         # 显存清理（当前循环结束）
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        _clear_cuda_cache()
 
         # reset_each=True 时，每次 run_one_case 内都会重建 editor（等价于从干净基座开始）
         # 这里无需额外处理
@@ -944,6 +1060,9 @@ def main():
 
     if fw:
         fw.close()
+
+    # 保守起见：主流程结束后尝试释放裁判模型缓存
+    release_judge()
 
 if __name__ == "__main__":
     main()
