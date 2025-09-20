@@ -7,6 +7,7 @@ import json
 import copy
 import argparse
 import warnings
+from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple, Union
 from datetime import timedelta
 
@@ -26,15 +27,29 @@ from easyeditor import (
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 
-# Optional judge placement controls (set in main)
-JUDGE_DEVICE_MAP: Optional[Union[str, Dict[str, Any]]] = None
-JUDGE_MAX_MEMORY: Optional[Dict[str, Any]] = None
+@dataclass
+class GenerationConfig:
+    mode: str
+    max_new_tokens: int
+    temperature: float
+    top_p: float
 
-# Judge/device management toggles (tweaked via CLI in main)
-DEFAULT_MIN_FREE_GPU_GIB = 3.0
-FORCE_CPU_JUDGE = False
-JUDGE_CACHE_ENABLED = True
-MIN_FREE_GPU_GIB = DEFAULT_MIN_FREE_GPU_GIB
+
+@dataclass
+class DeepSpeedConfig:
+    enabled: bool
+    dtype: str
+    max_out_tokens: int
+    kernel_inject: bool
+    mp_size: int
+
+
+@dataclass
+class JudgeConfig:
+    model_id: str
+    device_map: Optional[Union[str, Dict[str, Any]]]
+    max_memory: Optional[Dict[str, Any]]
+    keep_loaded: bool = False
 
 
 def _clear_cuda_cache():
@@ -48,39 +63,6 @@ def _clear_cuda_cache():
         except Exception:
             pass
 
-
-def _is_cpu_device_map(device_map: Optional[Union[str, Dict[str, Any]]]) -> bool:
-    if device_map is None:
-        return False
-    if isinstance(device_map, str):
-        return device_map.lower() == "cpu"
-    if isinstance(device_map, dict):
-        return all(
-            (isinstance(v, str) and v.lower() in {"cpu", "disk"})
-            or (isinstance(v, int) and v < 0)
-            for v in device_map.values()
-        )
-    return False
-
-
-def _should_force_cpu_for_judge(user_device_map: Optional[Union[str, Dict[str, Any]]]) -> bool:
-    if FORCE_CPU_JUDGE:
-        return True
-    if user_device_map is not None and not (
-        isinstance(user_device_map, str) and user_device_map.lower() in {"", "auto", "balanced", "balanced_low_0", "sequential"}
-    ):
-        # User provided explicit mapping; respect it.
-        return False
-    if not torch.cuda.is_available():
-        return True
-    if MIN_FREE_GPU_GIB <= 0:
-        return False
-    try:
-        free_bytes, _total_bytes = torch.cuda.mem_get_info()
-        free_gib = free_bytes / (1024 ** 3)
-    except Exception:
-        return False
-    return free_gib < MIN_FREE_GPU_GIB
 
 # ===================== 工具 =====================
 def pick_dtype() -> torch.dtype:
@@ -584,75 +566,44 @@ def extract_final(text: str) -> Tuple[str, str]:
     return final, reason
 
 # ===================== LLM-Judge =====================
-_JUDGE_CACHE = {}
-def load_judge(model_id: str) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
-    if JUDGE_CACHE_ENABLED and model_id in _JUDGE_CACHE:
-        return _JUDGE_CACHE[model_id]
+class JudgeManager:
+    def __init__(self, config: JudgeConfig):
+        self.config = config
+        self._tokenizer: Optional[AutoTokenizer] = None
+        self._model: Optional[AutoModelForCausalLM] = None
 
-    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    ensure_pad_token(tok)
+    def load(self) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
+        if self._model is None:
+            tok = AutoTokenizer.from_pretrained(self.config.model_id, trust_remote_code=True)
+            ensure_pad_token(tok)
 
-    # Respect optional judge placement controls; default to 'auto' if unset.
-    user_dm = JUDGE_DEVICE_MAP if JUDGE_DEVICE_MAP is not None else "auto"
-    force_cpu = _should_force_cpu_for_judge(user_dm)
-    resolved_dm: Optional[Union[str, Dict[str, Any]]] = "cpu" if force_cpu else user_dm
-    cpu_target = _is_cpu_device_map(resolved_dm)
+            kwargs = dict(torch_dtype=pick_dtype(), trust_remote_code=True)
+            if self.config.device_map is not None:
+                kwargs["device_map"] = self.config.device_map
+            if self.config.max_memory is not None:
+                kwargs["max_memory"] = self.config.max_memory
 
-    def _load(resolved_map, dtype, max_mem=None, low_cpu=False):
-        kwargs = dict(torch_dtype=dtype, trust_remote_code=True)
-        if resolved_map is not None:
-            kwargs["device_map"] = resolved_map
-        if max_mem is not None:
-            kwargs["max_memory"] = max_mem
-        if low_cpu:
-            kwargs["low_cpu_mem_usage"] = True
-        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+            self._model = AutoModelForCausalLM.from_pretrained(self.config.model_id, **kwargs)
+            self._tokenizer = tok
+        return self._tokenizer, self._model
 
-    dtype = torch.float32 if cpu_target else pick_dtype()
-    max_mem = None if cpu_target else JUDGE_MAX_MEMORY
+    def release_if_needed(self, force: bool = False) -> None:
+        if not force and self.config.keep_loaded:
+            return
+        if self._model is not None:
+            try:
+                del self._model
+            finally:
+                self._model = None
+        if self._tokenizer is not None:
+            try:
+                del self._tokenizer
+            finally:
+                self._tokenizer = None
+        _clear_cuda_cache()
 
-    try:
-        mdl = _load(resolved_dm, dtype, max_mem=max_mem, low_cpu=cpu_target)
-    except RuntimeError as exc:
-        msg = str(exc).lower()
-        if not cpu_target and ("cuda out of memory" in msg or "cublas" in msg or "mmalloc" in msg):
-            warnings.warn("裁判模型加载触发显存不足，将退回 CPU 运行。")
-            dtype = torch.float32
-            mdl = _load("cpu", dtype, max_mem=None, low_cpu=True)
-            cpu_target = True
-            resolved_dm = "cpu"
-        else:
-            raise
-    except Exception as exc:
-        warnings.warn(f"加载裁判模型时多卡/内存配置失败，将退回单设备：{exc}")
-        dtype = torch.float32 if force_cpu else pick_dtype()
-        fallback_dm = "cpu" if force_cpu else None
-        mdl = _load(fallback_dm, dtype, max_mem=None if fallback_dm == "cpu" else JUDGE_MAX_MEMORY, low_cpu=(fallback_dm == "cpu"))
-
-    if JUDGE_CACHE_ENABLED:
-        _JUDGE_CACHE[model_id] = (tok, mdl)
-    return tok, mdl
-
-
-def release_judge(model_id: Optional[str] = None) -> None:
-    if model_id is not None:
-        entries = [model_id]
-    else:
-        entries = list(_JUDGE_CACHE.keys())
-    for mid in entries:
-        pair = _JUDGE_CACHE.pop(mid, None)
-        if pair is None:
-            continue
-        tok, mdl = pair
-        try:
-            del tok
-        except Exception:
-            pass
-        try:
-            del mdl
-        except Exception:
-            pass
-    _clear_cuda_cache()
+    def shutdown(self) -> None:
+        self.release_if_needed(force=True)
 
 JUDGE_PROMPT = """You are a precise grader.
 Only judge the FINAL_ANSWER string; ignore any hidden thoughts/reasoning if present.
@@ -666,226 +617,257 @@ FINAL_ANSWER: {final}
 
 Decision (YES or NO):"""
 
-def judge_hit(judge_model_id: str, question: str, final: str, golds: List[str],
+def judge_hit(tok: AutoTokenizer, mdl: AutoModelForCausalLM,
+              question: str, final: str, golds: List[str],
               max_new_tokens: int = 8, debug: bool = False) -> int:
-    tok, mdl = load_judge(judge_model_id)
     prompt = JUDGE_PROMPT.format(question=question, golds=", ".join(golds), final=final)
-    enc = tok(prompt, return_tensors="pt").to(mdl.device)
+    enc = tok(prompt, return_tensors="pt")
+    target_device = _infer_model_device(mdl)
+    enc = {k: (v.to(target_device) if hasattr(v, "to") else v) for k, v in enc.items()}
+    input_ids = enc["input_ids"]
     out = mdl.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tok.pad_token_id)
-    txt = tok.decode(out[0][enc.input_ids.shape[1]:], skip_special_tokens=True).strip().upper()
+    txt = tok.decode(out[0][input_ids.shape[1]:], skip_special_tokens=True).strip().upper()
     if debug:
         print("[LLM-JUDGE RAW]:", txt)
     return int(("YES" in txt) and ("NO" not in txt))
 
 # ===================== 单条：可选“编辑前” + 编辑 + 评测 =====================
+
 def run_one_case(
     req: Dict[str, Any],
     alg: str,
     hparams: str,
     model_override: str,
-    judge_model: str,
-    gen_mode: str,
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
+    generation_cfg: GenerationConfig,
+    judge_manager: JudgeManager,
     eval_before: bool = False,
     show_eemetrics: bool = False,
     gen_device_map: Optional[Union[str, Dict[str, Any]]] = None,
     gen_max_memory: Optional[Dict[str, Any]] = None,
     skip_locality: bool = False,
-    use_ds_infer: bool = False,
-    ds_dtype: str = "auto",
-    ds_max_out_tokens: int = 0,
-    ds_kernel_inject: bool = True,
-    ds_mp_size: int = 1,
+    ds_cfg: Optional[DeepSpeedConfig] = None,
     dist_rank: int = 0,
     dist_world_size: int = 1,
     dist_local_rank: int = 0,
 ) -> Dict[str, Any]:
 
-    # 0) ROME subject 准备
-    if alg.upper() == "ROME":
-        s = req.get("subject", "")
-        if not s:
-            s = heuristic_extract_subject(req["prompt"])
-            if s:
-                warnings.warn(f"[ROME] subject missing; heuristically extracted '{s}'")
-            else:
-                raise ValueError(f"[ROME] cannot find subject for prompt: {req['prompt']}")
-        if s not in req["prompt"]:
-            req = dict(req)
-            req["prompt"] = f"{req['prompt']} (Subject: {s})"
-            req["subject"] = s
+    gen_mode = generation_cfg.mode
+    max_new_tokens = generation_cfg.max_new_tokens
+    temperature = generation_cfg.temperature
+    top_p = generation_cfg.top_p
 
-    # 构建编辑器（优先一次性加载，避免重复占显存）
-    base_model_id = model_override  # 若为空，后面会从 editor.hparams 取
-    editor = build_editor(alg, hparams, model_override)
-    if not base_model_id:
-        base_model_id = getattr(editor.hparams, "model_name", "")
+    ds_enabled = bool(ds_cfg and ds_cfg.enabled)
+    ds_dtype = ds_cfg.dtype if ds_cfg else "auto"
+    ds_max_out_tokens = ds_cfg.max_out_tokens if ds_cfg else 0
+    ds_kernel_inject = ds_cfg.kernel_inject if ds_cfg else True
+    ds_mp_size = ds_cfg.mp_size if ds_cfg else 1
 
-    #（可选）编辑前评测（尽量直接用已加载的 editor.model 与 editor.tok）
-    pred_before, a_for_score_before, rewrite_hit_before = "", "", None
-    if eval_before:
-        if not (use_ds_infer and (ds_mp_size or 0) > 1 and dist_world_size > 1 and dist_rank != 0):
-            mdl0 = getattr(editor, "model", None)
-            tok0 = _unwrap_tokenizer(getattr(editor, "tok", None))
-            if mdl0 is None or tok0 is None:
-                # 回退到单独加载一次基座模型
-                bm_id = base_model_id
-                tok0 = AutoTokenizer.from_pretrained(bm_id, trust_remote_code=True)
-                ensure_pad_token(tok0)
-                mdl0 = AutoModelForCausalLM.from_pretrained(
-                    bm_id,
-                    torch_dtype=pick_dtype(),
-                    trust_remote_code=True,
-                    device_map=(gen_device_map if gen_device_map else "auto"),
-                    max_memory=gen_max_memory,
+    judge_tok: Optional[AutoTokenizer] = None
+    judge_model: Optional[AutoModelForCausalLM] = None
+    judge_loaded = False
+    editor: Optional[BaseEditor] = None
+    edited_model = None
+
+    try:
+        if dist_rank == 0:
+            judge_tok, judge_model = judge_manager.load()
+            judge_loaded = True
+
+        if alg.upper() == "ROME":
+            s = req.get("subject", "")
+            if not s:
+                s = heuristic_extract_subject(req["prompt"])
+                if s:
+                    warnings.warn(f"[ROME] subject missing; heuristically extracted '{s}'")
+                else:
+                    raise ValueError(f"[ROME] cannot find subject for prompt: {req['prompt']}")
+            if s not in req["prompt"]:
+                req = dict(req)
+                req["prompt"] = f"{req['prompt']} (Subject: {s})"
+                req["subject"] = s
+
+        base_model_id = model_override
+        editor = build_editor(alg, hparams, model_override)
+        if not base_model_id:
+            base_model_id = getattr(editor.hparams, "model_name", "")
+
+        pred_before, a_for_score_before, rewrite_hit_before = "", "", None
+        if eval_before:
+            if not (ds_enabled and (ds_mp_size or 0) > 1 and dist_world_size > 1 and dist_rank != 0):
+                mdl0 = getattr(editor, "model", None)
+                tok0 = _unwrap_tokenizer(getattr(editor, "tok", None))
+                if mdl0 is None or tok0 is None:
+                    bm_id = base_model_id
+                    tok0 = AutoTokenizer.from_pretrained(bm_id, trust_remote_code=True)
+                    ensure_pad_token(tok0)
+                    mdl0 = AutoModelForCausalLM.from_pretrained(
+                        bm_id,
+                        torch_dtype=pick_dtype(),
+                        trust_remote_code=True,
+                        device_map=(gen_device_map if gen_device_map else "auto"),
+                        max_memory=gen_max_memory,
+                    )
+                    need_release = True
+                else:
+                    ensure_pad_token(tok0)
+                    need_release = False
+
+                pred_before = generate_answer(
+                    mdl0,
+                    tok0,
+                    req["prompt"],
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    mode=gen_mode,
                 )
-                need_release = True
-            else:
-                ensure_pad_token(tok0)
-                need_release = False
+                if gen_mode == "reason":
+                    final_b, _ = extract_final(pred_before)
+                    a_for_score_before = final_b if final_b else pred_before
+                else:
+                    a_for_score_before = pred_before
+                if dist_rank == 0 and judge_model is not None and judge_tok is not None:
+                    rewrite_hit_before = judge_hit(
+                        judge_tok,
+                        judge_model,
+                        question=req["prompt"],
+                        final=a_for_score_before,
+                        golds=[req.get("target_new", "")],
+                    )
 
-            pred_before = generate_answer(
-                mdl0, tok0, req["prompt"],
-                max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
-                mode=gen_mode
-            )
-            if gen_mode == "reason":
-                final_b, _ = extract_final(pred_before)
-                a_for_score_before = final_b if final_b else pred_before
-            else:
-                a_for_score_before = pred_before
-            # judge 仅在 rank0 评测输出
-            if dist_rank == 0:
-                rewrite_hit_before = judge_hit(judge_model, question=req["prompt"], final=a_for_score_before, golds=[req.get("target_new","")])
+                if need_release:
+                    try:
+                        del mdl0
+                        del tok0
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
 
-            # 如有必要释放回退加载的模型
-            if need_release:
-                try:
-                    del mdl0; del tok0
-                    if torch.cuda.is_available(): torch.cuda.empty_cache()
-                except Exception:
-                    pass
+        metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
+        if show_eemetrics and dist_rank == 0:
+            print("[EASYEDIT METRICS]", json.dumps(metrics, ensure_ascii=False))
 
-    # 执行编辑（单条）。关键：sequential_edit=True 以保留编辑后的权重供外部生成。
-    metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
-    if show_eemetrics and dist_rank == 0:
-        print("[EASYEDIT METRICS]", json.dumps(metrics, ensure_ascii=False))
-    
-    # 选择推理并行方案
-    use_ds_tensor_parallel = bool(use_ds_infer and (ds_mp_size or 0) > 1 and dist_world_size > 1)
-    if use_ds_tensor_parallel:
-        # 若选择 DS 张量并行，多数情况下不要再用 accelerate 分片
-        if gen_device_map is not None:
-            warnings.warn("已启用 DeepSpeed 张量并行，将忽略 gen_device_map/accelerate 分片。")
-        try:
-            import deepspeed
-        except Exception:
-            warnings.warn("未安装 deepspeed，无法进行多卡 DS 推理，退回单卡/accelerate 模式。")
-            use_ds_tensor_parallel = False
+        use_ds_tensor_parallel = bool(ds_enabled and (ds_mp_size or 0) > 1 and dist_world_size > 1)
+        if use_ds_tensor_parallel:
+            if gen_device_map is not None:
+                warnings.warn("已启用 DeepSpeed 张量并行，将忽略 gen_device_map/accelerate 分片。")
+            try:
+                import deepspeed  # type: ignore
+            except Exception:
+                warnings.warn("未安装 deepspeed，无法进行多卡 DS 推理，退回单卡/accelerate 模式。")
+                use_ds_tensor_parallel = False
 
-    if use_ds_tensor_parallel:
-        # 在多进程环境下，每个 rank 都有一份相同的 edited_model，然后做 DS TP 注入。
-        target_dtype = torch.bfloat16 if ds_dtype == "bf16" else (torch.float16 if ds_dtype == "fp16" else pick_dtype())
-        try:
-            import deepspeed
-            engine = deepspeed.init_inference(
+        if use_ds_tensor_parallel:
+            target_dtype = torch.bfloat16 if ds_dtype == "bf16" else (torch.float16 if ds_dtype == "fp16" else pick_dtype())
+            try:
+                import deepspeed  # type: ignore
+
+                engine = deepspeed.init_inference(
+                    edited_model,
+                    mp_size=dist_world_size,
+                    dtype=target_dtype,
+                    replace_method="auto",
+                    replace_with_kernel_inject=bool(ds_kernel_inject),
+                )
+                edited_model = engine.module
+            except Exception as exc:
+                warnings.warn(f"DeepSpeed 张量并行初始化失败，退回 accelerate/单卡：{exc}")
+                use_ds_tensor_parallel = False
+
+        if not use_ds_tensor_parallel:
+            edited_model = _maybe_dispatch_generation_model(edited_model, gen_device_map, gen_max_memory)
+            edited_model = _maybe_apply_ds_inference(
                 edited_model,
-                mp_size=dist_world_size,
-                dtype=target_dtype,
-                replace_method="auto",
-                replace_with_kernel_inject=bool(ds_kernel_inject),
+                use_ds_infer=ds_enabled,
+                ds_dtype=ds_dtype,
+                ds_max_out_tokens=ds_max_out_tokens,
+                ds_kernel_inject=ds_kernel_inject,
             )
-            edited_model = engine.module
-        except Exception as exc:
-            warnings.warn(f"DeepSpeed 张量并行初始化失败，退回 accelerate/单卡：{exc}")
-            use_ds_tensor_parallel = False
 
-    if not use_ds_tensor_parallel:
-        # 仍然可用 accelerate 多卡分片，或单卡
-        edited_model = _maybe_dispatch_generation_model(edited_model, gen_device_map, gen_max_memory)
-        # 单卡 kernel 注入（若开启）
-        edited_model = _maybe_apply_ds_inference(
+        tok = _unwrap_tokenizer(getattr(editor, "tok", None)) or AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
+        ensure_pad_token(tok)
+        pred_after = generate_answer(
             edited_model,
-            use_ds_infer=use_ds_infer,
-            ds_dtype=ds_dtype,
-            ds_max_out_tokens=ds_max_out_tokens,
-            ds_kernel_inject=ds_kernel_inject,
+            tok,
+            req["prompt"],
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            mode=gen_mode,
         )
-    # 这里不再重复注入 DeepSpeed，避免显存重复占用
+        if gen_mode == "reason":
+            final_after, _ = extract_final(pred_after)
+            a_for_score_after = final_after if final_after else pred_after
+        else:
+            a_for_score_after = pred_after
 
-    # 用编辑后模型生成（直接复用 editor.tok，保持与训练一致）
-    tok = _unwrap_tokenizer(getattr(editor, "tok", None)) or AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
-    ensure_pad_token(tok)
-    pred_after = generate_answer(
-        edited_model, tok, req["prompt"],
-        max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
-        mode=gen_mode
-    )
-    if gen_mode == "reason":
-        final_after, _ = extract_final(pred_after)
-        a_for_score_after = final_after if final_after else pred_after
-    else:
-        a_for_score_after = pred_after
+        rewrite_hit_after = (
+            judge_hit(judge_tok, judge_model, question=req["prompt"], final=a_for_score_after, golds=[req.get("target_new", "")])
+            if dist_rank == 0 and judge_model is not None and judge_tok is not None
+            else None
+        )
 
-    rewrite_hit_after = judge_hit(judge_model, question=req["prompt"], final=a_for_score_after, golds=[req.get("target_new","")]) if dist_rank == 0 else None
+        loc_rec: Dict[str, Any] = {}
+        if (not skip_locality) and isinstance(req.get("locality"), dict) and "nq" in req["locality"]:
+            lp = req["locality"]["nq"].get("prompt", "")
+            lg = req["locality"]["nq"].get("ground_truth", "")
+            if lp and lg:
+                loc_pred = generate_answer(
+                    edited_model,
+                    tok,
+                    lp,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    mode=gen_mode,
+                )
+                loc_final, _ = extract_final(loc_pred) if gen_mode == "reason" else (loc_pred, "")
+                loc_hit = (
+                    judge_hit(judge_tok, judge_model, question=lp, final=(loc_final or loc_pred), golds=[lg])
+                    if dist_rank == 0 and judge_model is not None and judge_tok is not None
+                    else None
+                )
+                loc_rec = {
+                    "loc_prompt": lp,
+                    "loc_gold": lg,
+                    "pred_loc": loc_pred,
+                    "locality_hit": (int(loc_hit) if loc_hit is not None else None),
+                }
 
-    # Locality（若提供）
-    loc_rec: Dict[str, Any] = {}
-    if (not skip_locality) and isinstance(req.get("locality"), dict) and "nq" in req["locality"]:
-        lp = req["locality"]["nq"].get("prompt", "")
-        lg = req["locality"]["nq"].get("ground_truth", "")
-        if lp and lg:
-            loc_pred = generate_answer(
-                edited_model, tok, lp,
-                max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
-                mode=gen_mode
-            )
-            loc_final, _ = extract_final(loc_pred) if gen_mode == "reason" else (loc_pred, "")
-            loc_hit = judge_hit(judge_model, question=lp, final=(loc_final or loc_pred), golds=[lg]) if dist_rank == 0 else None
-            loc_rec = {
-                "loc_prompt": lp,
-                "loc_gold": lg,
-                "pred_loc": loc_pred,
-                "locality_hit": (int(loc_hit) if loc_hit is not None else None),
-            }
+        rec_rewrite_hit = int(rewrite_hit_after) if rewrite_hit_after is not None else None
+        rec: Dict[str, Any] = {
+            "prompt": req["prompt"],
+            "target_new": req["target_new"],
+            "pred_after": pred_after,
+            "rewrite_hit": rec_rewrite_hit,
+            "easyedit_metrics": metrics[0] if isinstance(metrics, list) and metrics else metrics,
+        }
+        if eval_before:
+            rec["pred_before"] = pred_before
+            rec["rewrite_hit_before"] = int(rewrite_hit_before) if rewrite_hit_before is not None else None
 
-    # E) 组装记录（存在才写）
-    rec_rewrite_hit = int(rewrite_hit_after) if rewrite_hit_after is not None else None
-    rec: Dict[str, Any] = {
-        "prompt": req["prompt"],
-        "target_new": req["target_new"],
-        "pred_after": pred_after,
-        "rewrite_hit": rec_rewrite_hit,
-        "easyedit_metrics": metrics[0] if isinstance(metrics, list) and metrics else metrics,
-    }
-    if eval_before:
-        rec["pred_before"] = pred_before
-        rec["rewrite_hit_before"] = (int(rewrite_hit_before) if rewrite_hit_before is not None else None)
+        rec.update(loc_rec)
+        rec.setdefault("loc_prompt", "")
+        rec.setdefault("loc_gold", "")
+        rec.setdefault("pred_loc", "")
+        rec.setdefault("locality_hit", None)
 
-    rec.update(loc_rec)
-        # --- MINIMAL PATCH: always provide locality keys to avoid KeyError ---
-    rec.setdefault("loc_prompt", "")
-    rec.setdefault("loc_gold", "")
-    rec.setdefault("pred_loc", "")
-    rec.setdefault("locality_hit", None)
-    # ---------------------------------------------------------------------
-
-    # 资源清理，避免多次 case 叠加显存/内存
-    try:
-        del edited_model
-    except Exception:
-        pass
-    try:
-        del editor
-    except Exception:
-        pass
-    if not JUDGE_CACHE_ENABLED:
-        release_judge(judge_model)
-    _clear_cuda_cache()
-
-    return rec
+        return rec
+    finally:
+        if edited_model is not None:
+            try:
+                del edited_model
+            except Exception:
+                pass
+        if editor is not None:
+            try:
+                del editor
+            except Exception:
+                pass
+        if judge_loaded:
+            judge_manager.release_if_needed()
+        _clear_cuda_cache()
 
 
 # ===================== 主流程（支持 repeat） =====================
@@ -912,12 +894,7 @@ def main():
     # Judge placement
     ap.add_argument("--judge_device_map", default="auto", help="裁判模型多卡 device_map（auto/… 或 JSON），默认 auto")
     ap.add_argument("--judge_max_memory", default="", help="裁判模型 max_memory JSON，如 '{\"cuda:2\": \"20GiB\", \"cuda:3\": \"20GiB\"}'")
-    ap.add_argument("--force_cpu_judge", action="store_true", help="强制裁判模型在 CPU 上运行，避免与编辑模型争抢显存")
-    ap.add_argument("--min_free_gpu_gib", type=float, default=DEFAULT_MIN_FREE_GPU_GIB,
-                    help="当检测到可用显存低于该阈值 (GiB) 时，自动将裁判模型回退到 CPU；设为 <=0 可关闭自动回退")
-    ap.add_argument("--no_judge_cache", dest="judge_cache", action="store_false",
-                    help="每条 case 结束后释放裁判模型，减少持续显存占用（会重复加载，略慢）")
-    ap.set_defaults(judge_cache=True)
+    ap.add_argument("--keep_judge_loaded", action="store_true", help="多条 case 共用同一个裁判模型实例，不在每次后释放显存")
     # DeepSpeed Inference（单卡 kernel injection）
     ap.add_argument("--use_ds_infer", action="store_true", help="编辑后生成阶段启用 DeepSpeed Inference kernel injection（单进程/单卡优先）")
     ap.add_argument("--ds_dtype", choices=["auto","bf16","fp16"], default="auto", help="DeepSpeed Inference 计算精度")
@@ -962,13 +939,26 @@ def main():
     except ValueError as exc:
         raise SystemExit(str(exc))
 
-    # Stash judge placement knobs for load_judge()
-    global JUDGE_DEVICE_MAP, JUDGE_MAX_MEMORY, FORCE_CPU_JUDGE, JUDGE_CACHE_ENABLED, MIN_FREE_GPU_GIB
-    JUDGE_DEVICE_MAP = judge_device_map
-    JUDGE_MAX_MEMORY = judge_max_memory
-    FORCE_CPU_JUDGE = bool(args.force_cpu_judge)
-    JUDGE_CACHE_ENABLED = bool(args.judge_cache)
-    MIN_FREE_GPU_GIB = float(args.min_free_gpu_gib)
+    generation_cfg = GenerationConfig(
+        mode=args.gen_mode,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+    )
+    ds_cfg = DeepSpeedConfig(
+        enabled=args.use_ds_infer,
+        dtype=args.ds_dtype,
+        max_out_tokens=args.ds_max_out_tokens,
+        kernel_inject=args.ds_kernel_inject,
+        mp_size=args.ds_mp_size,
+    )
+    judge_cfg = JudgeConfig(
+        model_id=args.judge_model,
+        device_map=judge_device_map,
+        max_memory=judge_max_memory,
+        keep_loaded=args.keep_judge_loaded,
+    )
+    judge_manager = JudgeManager(judge_cfg)
 
     # If user didn't provide max_memory and has multi-GPU, derive a safe default for gen.
     if gen_device_map and isinstance(gen_device_map, str) and gen_device_map in {"auto","balanced","balanced_low_0"}:
@@ -1018,21 +1008,14 @@ def main():
                 alg=args.alg,
                 hparams=args.hparams,
                 model_override=args.model,
-                judge_model=args.judge_model,
-                gen_mode=args.gen_mode,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
+                generation_cfg=generation_cfg,
+                judge_manager=judge_manager,
                 eval_before=args.eval_before,
                 show_eemetrics=args.show_eemetrics,
                 gen_device_map=gen_device_map,
                 gen_max_memory=gen_max_memory,
                 skip_locality=args.skip_locality,
-                use_ds_infer=args.use_ds_infer,
-                ds_dtype=args.ds_dtype,
-                ds_max_out_tokens=args.ds_max_out_tokens,
-                ds_kernel_inject=args.ds_kernel_inject,
-                ds_mp_size=args.ds_mp_size,
+                ds_cfg=ds_cfg,
                 dist_rank=dist_rank,
                 dist_world_size=dist_world,
                 dist_local_rank=dist_local,
@@ -1061,8 +1044,7 @@ def main():
     if fw:
         fw.close()
 
-    # 保守起见：主流程结束后尝试释放裁判模型缓存
-    release_judge()
+    judge_manager.shutdown()
 
 if __name__ == "__main__":
     main()
