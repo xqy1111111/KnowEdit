@@ -86,16 +86,27 @@ def _linear_pre_hook_align(module: nn.Linear, inputs):
 
 
 def install_linear_safety_hooks(model: nn.Module, in_features: int = 3584, max_out_features: int = 64) -> int:
-    """Install pre-hooks on narrow Linear layers to stabilize cuBLASLt matmul."""
+    """Install pre-hooks on narrow Linear-like layers to stabilize cuBLASLt matmul."""
     count = 0
     for name, mod in model.named_modules():
-        if isinstance(mod, nn.Linear) and mod.in_features == in_features and mod.out_features <= max_out_features:
-            if getattr(mod, "_safety_hook_installed", False):
-                continue
+        weight = getattr(mod, "weight", None)
+        if weight is None or not hasattr(weight, "shape"):
+            continue
+        if getattr(mod, "_safety_hook_installed", False):
+            continue
+        if weight.ndim != 2:
+            continue
+        out_features, in_feats = weight.shape
+        if in_feats != in_features or out_features > max_out_features:
+            continue
+        # Install hook (works for nn.Linear and custom linear-likes taking single tensor input)
+        try:
             mod.register_forward_pre_hook(_linear_pre_hook_align, with_kwargs=False)
             setattr(mod, "_safety_hook_installed", True)
             count += 1
-            print(f"[hook] Installed safety pre-hook on Linear {name} ({mod.in_features}->{mod.out_features})")
+            print(f"[hook] Installed safety pre-hook on {type(mod).__name__} {name} ({in_feats}->{out_features})")
+        except Exception as hook_err:
+            warnings.warn(f"[hook] failed to register on {name}: {hook_err}")
     return count
 
 
