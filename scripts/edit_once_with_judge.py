@@ -1056,7 +1056,9 @@ def main():
     fw = None
     if args.save_jsonl:
         path = os.path.abspath(os.path.expanduser(args.save_jsonl))
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        dirpath = os.path.dirname(path)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
         fw = open(path, "a", encoding="utf-8")
 
     base_idx = args.case_index
