@@ -502,6 +502,12 @@ def _build_messages(prompt: str, mode: str) -> list:
         )
     elif mode == "concise":
         sys_msg = "Answer with a short noun phrase only. Do NOT explain."
+    elif mode == "r1d":
+        # DeepSeek-R1-Distill 友好：仅使用 user 消息，并在内容内以 <think> 起手
+        # 官方建议避免使用 system，将指令写入 user。
+        return [
+            {"role": "user", "content": f"<think>\n{prompt}"}
+        ]
     else:  # "noprompt": 仅用户消息，不注入系统提示
         return [
             {"role": "user", "content": prompt}
@@ -558,21 +564,38 @@ def generate_answer(model, tokenizer, prompt: str,
             eos_token_id=eos_ids[0] if len(eos_ids) == 1 else eos_ids,
             pad_token_id=tokenizer.pad_token_id,
             no_repeat_ngram_size=3,
+            repetition_penalty=(1.07 if mode in {"reason", "r1d"} else 1.0),
         )
-    ans = tokenizer.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
-    return ans.strip()
+    gen_txt = tokenizer.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
+    # 返回完整文本；分段由 extract_final 在上层完成
+    return gen_txt.strip()
 
 # ===================== 解析 <final> =====================
 _FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 _REASON_RE = re.compile(r"<reasoning>\s*(.*?)\s*</reasoning>", re.IGNORECASE | re.DOTALL)
+_THINK_RE = re.compile(r"<think>\s*(.*?)\s*</think>", re.IGNORECASE | re.DOTALL)
 def extract_final(text: str) -> Tuple[str, str]:
+    """通用解析：优先支持 <final>/<reasoning>；若无，则回退为 <think>…</think> + 其后的答案段。
+    返回 (final_text, reasoning_or_think_text)。
+    """
     if not text:
         return "", ""
+    # 1) 优先匹配 <final>/<reasoning>
     m_f = _FINAL_RE.search(text)
     m_r = _REASON_RE.search(text)
-    final = (m_f.group(1).strip() if m_f else "").strip("：:").strip()
-    reason = (m_r.group(1).strip() if m_r else "").strip()
-    return final, reason
+    if m_f or m_r:
+        final = (m_f.group(1).strip() if m_f else "").strip("：:").strip()
+        reason = (m_r.group(1).strip() if m_r else "").strip()
+        return final, reason
+    # 2) 回退到 <think> 语法：提取最后一个 </think> 后的文本作为 final；中间为思维段
+    last = None
+    for m in _THINK_RE.finditer(text):
+        last = m
+    if last is not None:
+        think_txt = last.group(1).strip()
+        tail = text[last.end():].strip()
+        return tail, think_txt
+    return "", ""
 
 # ===================== LLM-Judge =====================
 class JudgeManager:
@@ -750,7 +773,7 @@ def run_one_case(
                     top_p=top_p,
                     mode=gen_mode,
                 )
-                if gen_mode == "reason":
+                if gen_mode in {"reason", "r1d"}:
                     final_b, _ = extract_final(pred_before)
                     a_for_score_before = final_b if final_b else pred_before
                 else:
@@ -825,7 +848,7 @@ def run_one_case(
             top_p=top_p,
             mode=gen_mode,
         )
-        if gen_mode == "reason":
+        if gen_mode in {"reason", "r1d"}:
             final_after, _ = extract_final(pred_after)
             a_for_score_after = final_after if final_after else pred_after
         else:
@@ -851,7 +874,7 @@ def run_one_case(
                     top_p=top_p,
                     mode=gen_mode,
                 )
-                loc_final, _ = extract_final(loc_pred) if gen_mode == "reason" else (loc_pred, "")
+                loc_final, _ = extract_final(loc_pred) if gen_mode in {"reason", "r1d"} else (loc_pred, "")
                 loc_hit = (
                     judge_hit(judge_tok, judge_model, question=lp, final=(loc_final or loc_pred), golds=[lg])
                     if dist_rank == 0 and judge_model is not None and judge_tok is not None
@@ -861,10 +884,12 @@ def run_one_case(
                     "loc_prompt": lp,
                     "loc_gold": lg,
                     "pred_loc": loc_pred,
+                    "final_loc": loc_final or "",
                     "locality_hit": (int(loc_hit) if loc_hit is not None else None),
                 }
 
         rec_rewrite_hit = int(rewrite_hit_after) if rewrite_hit_after is not None else None
+        # 记录完整输出，同时附加分段字段（final/think or reasoning）
         rec: Dict[str, Any] = {
             "prompt": req["prompt"],
             "target_new": req["target_new"],
@@ -872,9 +897,22 @@ def run_one_case(
             "rewrite_hit": rec_rewrite_hit,
             "easyedit_metrics": metrics[0] if isinstance(metrics, list) and metrics else metrics,
         }
+        if gen_mode in {"reason", "r1d"}:
+            fa, rs = extract_final(pred_after)
+            if fa:
+                rec["final_after"] = fa
+            if rs:
+                # 对 reason 模式是 <reasoning>，对 r1d 模式是 <think>
+                rec["reasoning_or_think_after"] = rs
         if eval_before:
             rec["pred_before"] = pred_before
             rec["rewrite_hit_before"] = int(rewrite_hit_before) if rewrite_hit_before is not None else None
+            if gen_mode in {"reason", "r1d"}:
+                fb, rb = extract_final(pred_before)
+                if fb:
+                    rec["final_before"] = fb
+                if rb:
+                    rec["reasoning_or_think_before"] = rb
 
         rec.update(loc_rec)
         rec.setdefault("loc_prompt", "")
@@ -914,7 +952,7 @@ def main():
     ap.add_argument("--judge_model", required=True, help="HF id/path for LLM Judge")
 
     # 生成控制
-    ap.add_argument("--gen_mode", choices=["concise","reason","noprompt"], default="concise")
+    ap.add_argument("--gen_mode", choices=["concise","reason","noprompt","r1d"], default="concise")
     ap.add_argument("--max_new_tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top_p", type=float, default=1.0)
