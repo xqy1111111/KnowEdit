@@ -12,6 +12,7 @@ from typing import List, Dict, Any, Optional, Tuple, Union
 from datetime import timedelta
 
 import torch
+import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizerBase
 from easyeditor import (
     BaseEditor,
@@ -62,6 +63,40 @@ def _clear_cuda_cache():
             torch.cuda.empty_cache()
         except Exception:
             pass
+
+
+def _linear_pre_hook_align(module: nn.Linear, inputs):
+    """Align device/dtype/layout before Linear forward to avoid cuBLASLt issues."""
+    if not inputs:
+        return inputs
+    (x,) = inputs
+    weight = module.weight
+    if x.device != weight.device:
+        x = x.to(weight.device, non_blocking=True)
+    if x.dtype != weight.dtype:
+        x = x.to(weight.dtype)
+    if not x.is_contiguous():
+        x = x.contiguous()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(weight.device)
+    except Exception:
+        pass
+    return (x,)
+
+
+def install_linear_safety_hooks(model: nn.Module, in_features: int = 3584, max_out_features: int = 64) -> int:
+    """Install pre-hooks on narrow Linear layers to stabilize cuBLASLt matmul."""
+    count = 0
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear) and mod.in_features == in_features and mod.out_features <= max_out_features:
+            if getattr(mod, "_safety_hook_installed", False):
+                continue
+            mod.register_forward_pre_hook(_linear_pre_hook_align, with_kwargs=False)
+            setattr(mod, "_safety_hook_installed", True)
+            count += 1
+            print(f"[hook] Installed safety pre-hook on Linear {name} ({mod.in_features}->{mod.out_features})")
+    return count
 
 
 # ===================== 工具 =====================
@@ -742,6 +777,16 @@ def run_one_case(
         editor = build_editor(alg, hparams, model_override)
         if not base_model_id:
             base_model_id = getattr(editor.hparams, "model_name", "")
+
+        # 安装 Linear 安全前置钩子，避免 cublasLt Matmul 在窄层上崩溃
+        try:
+            model_for_edit = getattr(editor, "model", None)
+            if isinstance(model_for_edit, nn.Module):
+                installed = install_linear_safety_hooks(model_for_edit, in_features=3584, max_out_features=64)
+                if installed == 0:
+                    print("[hook] No Linear layers (3584-><=64) found; safety hook skipped.")
+        except Exception as hook_exc:
+            warnings.warn(f"[hook] failed to install safety hooks: {hook_exc}")
 
         pred_before, a_for_score_before, rewrite_hit_before = "", "", None
         if eval_before:
