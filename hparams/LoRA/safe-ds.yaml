@@ -1,0 +1,26 @@
+alg_name: "LoRA"
+model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+
+# LoRA
+lora_type: "lora"
+rank: 8            # 如需更稳可 4
+lora_alpha: 32
+lora_dropout: 0.05
+# 仅中高层，举例（按 0-based 层号；如与你模型不符可在日志里打印层数再改）
+layers: [12, 16, 20, 24]
+# 先只改 q；若编辑力度不够，再加 o_proj
+target_modules: ["q_proj"]
+
+# 正则与稳定
+kl_factor: 1.0
+norm_constraint: true
+
+# 训练
+num_steps: 20
+batch_size: 1
+max_length: 2048
+lr: 1e-4
+weight_decay: 0.0
+
+model_parallel: False
+device: 0

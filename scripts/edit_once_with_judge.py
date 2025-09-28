@@ -542,8 +542,8 @@ def _build_messages(prompt: str, mode: str) -> list:
     if mode == "reason":
         sys_msg = (
             "You are a helpful assistant. "
-            "Think step by step INSIDE <reasoning>...</reasoning>. "
-            "Then output ONLY the final short answer INSIDE <final>...</final>. "
+            "Think step by step INSIDE <think>...</think>. "
+            "Then output ONLY the final short answer INSIDE <answer>...</answer>. "
             "Do not include anything else outside these tags."
         )
     elif mode == "concise":
@@ -576,8 +576,8 @@ def generate_answer(model, tokenizer, prompt: str,
         else:
             if mode == "reason":
                 text = (
-                    "You are a helpful assistant. Think step by step INSIDE <reasoning>...</reasoning>. less but useful steps are appriciated"
-                    "Then output ONLY the final short answer INSIDE <final>...</final>.\n"
+                    "You are a helpful assistant. Think step by step INSIDE <think>...</think>. less but useful steps are appriciated"
+                    "Then output ONLY the final short answer INSIDE <answer>...</answer>.\n"
                     f"Q: {prompt}\nA:"
                 )
             else:  # concise
