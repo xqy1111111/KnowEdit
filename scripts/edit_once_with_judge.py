@@ -121,12 +121,16 @@ def pick_dtype() -> torch.dtype:
         return torch.float16
     return torch.float32
 
-def ensure_pad_token(tokenizer: AutoTokenizer):
-    if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token_id is not None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-        else:
-            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+def ensure_pad_token(tokenizer: AutoTokenizer) -> bool:
+    """Ensure tokenizer has a valid pad id; return True if new tokens were added."""
+    if tokenizer.pad_token_id is not None:
+        return False
+    if tokenizer.eos_token_id is not None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        return False
+    before = len(tokenizer)
+    tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+    return len(tokenizer) != before
 
 def _unwrap_tokenizer(tok_like: Any) -> Optional[PreTrainedTokenizerBase]:
     if tok_like is None:
@@ -141,6 +145,34 @@ def _unwrap_tokenizer(tok_like: Any) -> Optional[PreTrainedTokenizerBase]:
             if isinstance(v, PreTrainedTokenizerBase) or hasattr(v, "save_pretrained"):
                 return v
     return None
+
+
+def ensure_tokenizer_model_vocab_alignment(tokenizer: Any, model: Any, context: str = "") -> bool:
+    """Resize model embeddings if tokenizer length changed; return True if resized."""
+    tok = _unwrap_tokenizer(tokenizer) if not isinstance(tokenizer, PreTrainedTokenizerBase) else tokenizer
+    if tok is None or model is None:
+        return False
+    resize_fn = getattr(model, "resize_token_embeddings", None)
+    get_inputs = getattr(model, "get_input_embeddings", None)
+    if not callable(resize_fn) or not callable(get_inputs):
+        return False
+    try:
+        tok_size = len(tok)
+    except Exception:
+        return False
+    try:
+        embeddings = get_inputs()
+        num_embeddings = getattr(embeddings, "num_embeddings", None)
+    except Exception:
+        num_embeddings = None
+    if not isinstance(num_embeddings, int):
+        return False
+    if tok_size == num_embeddings:
+        return False
+    prefix = f"{context} " if context else ""
+    warnings.warn(f"{prefix}[vocab] tokenizer={tok_size}, embeddings={num_embeddings}; resizing to match.")
+    resize_fn(tok_size)
+    return True
 
 
 def _parse_device_map_arg(device_map: str) -> Optional[Union[str, Dict[str, Any]]]:
@@ -585,6 +617,7 @@ def generate_answer(model, tokenizer, prompt: str,
                 text = f"Answer with a short noun phrase only. Do NOT explain.\nQ: {prompt}\nA:"
 
     ensure_pad_token(tokenizer)
+    ensure_tokenizer_model_vocab_alignment(tokenizer, model, context="[generate]")
     enc = tokenizer(text, return_tensors="pt")
     target_device = _infer_model_device(model)
     enc = {k: (v.to(target_device) if hasattr(v, "to") else v) for k, v in enc.items()}
@@ -664,6 +697,7 @@ class JudgeManager:
 
             self._model = AutoModelForCausalLM.from_pretrained(self.config.model_id, **kwargs)
             self._tokenizer = tok
+            ensure_tokenizer_model_vocab_alignment(tok, self._model, context="[judge]")
         return self._tokenizer, self._model
 
     def release_if_needed(self, force: bool = False) -> None:
@@ -790,9 +824,15 @@ def run_one_case(
         if not base_model_id:
             base_model_id = getattr(editor.hparams, "model_name", "")
 
+        model_for_edit = getattr(editor, "model", None)
+        tok_for_edit = _unwrap_tokenizer(getattr(editor, "tok", None))
+        if tok_for_edit is not None:
+            ensure_pad_token(tok_for_edit)
+        if isinstance(model_for_edit, nn.Module) and tok_for_edit is not None:
+            ensure_tokenizer_model_vocab_alignment(tok_for_edit, model_for_edit, context="[editor]")
+
         # 安装 Linear 安全前置钩子，避免 cublasLt Matmul 在窄层上崩溃
         try:
-            model_for_edit = getattr(editor, "model", None)
             if isinstance(model_for_edit, nn.Module):
                 installed = install_linear_safety_hooks(model_for_edit, in_features=3584, max_out_features=64)
                 if installed == 0:
@@ -820,6 +860,8 @@ def run_one_case(
                 else:
                     ensure_pad_token(tok0)
                     need_release = False
+
+                ensure_tokenizer_model_vocab_alignment(tok0, mdl0, context="[eval_before]")
 
                 pred_before = generate_answer(
                     mdl0,
@@ -854,6 +896,8 @@ def run_one_case(
                         pass
 
         metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
+        if tok_for_edit is not None:
+            ensure_tokenizer_model_vocab_alignment(tok_for_edit, edited_model, context="[editor.after_edit]")
         if show_eemetrics and dist_rank == 0:
             print("[EASYEDIT METRICS]", json.dumps(metrics, ensure_ascii=False))
 
@@ -896,6 +940,7 @@ def run_one_case(
 
         tok = _unwrap_tokenizer(getattr(editor, "tok", None)) or AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
         ensure_pad_token(tok)
+        ensure_tokenizer_model_vocab_alignment(tok, edited_model, context="[after_edit]")
         pred_after = generate_answer(
             edited_model,
             tok,
