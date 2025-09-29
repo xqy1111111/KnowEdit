@@ -552,7 +552,8 @@ def _build_messages(prompt: str, mode: str) -> list:
         # DeepSeek-R1-Distill 友好：仅使用 user 消息，并在内容内以 <think> 起手
         # 官方建议避免使用 system，将指令写入 user。
         return [
-            {"role": "user", "content": f"<think>\n{prompt}"}
+            {"role": "user", "content": f"{prompt}" + "\nThink step by step INSIDE <think>...</think>. Then output ONLY the final short answer INSIDE <answer>...</answer>. Do not include anything else outside these tags."},
+            {"role": "assistant", "content": "<think>"},  
         ]
     else:  # "noprompt": 仅用户消息，不注入系统提示
         return [
@@ -572,7 +573,7 @@ def generate_answer(model, tokenizer, prompt: str,
     else:
         messages = _build_messages(prompt, mode=mode)
         if hasattr(tokenizer, "apply_chat_template"):
-            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         else:
             if mode == "reason":
                 text = (
