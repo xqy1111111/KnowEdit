@@ -15,7 +15,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 try:
     from dotenv import load_dotenv
@@ -160,6 +160,64 @@ def create_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
+def extract_text(response: Any) -> str:
+    """Best-effort extraction of text content from diverse OpenAI client responses."""
+    if response is None:
+        raise ValueError("Model returned no response.")
+
+    if isinstance(response, str):
+        text = response
+    elif hasattr(response, "output_text"):
+        text = response.output_text  # type: ignore[attr-defined]
+    elif hasattr(response, "output") and isinstance(getattr(response, "output"), list):
+        # OpenAI Responses API returns structured content blocks.
+        parts: List[str] = []
+        for block in response.output:  # type: ignore[attr-defined]
+            content = getattr(block, "content", None)
+            if isinstance(content, list):
+                for chunk in content:
+                    chunk_type = getattr(chunk, "type", None)
+                    if isinstance(chunk, dict):
+                        chunk_type = chunk.get("type")
+                        chunk_text = chunk.get("text")
+                    else:
+                        chunk_text = getattr(chunk, "text", None)
+                    if chunk_type in {"output_text", "text", None} and chunk_text:
+                        parts.append(str(chunk_text))
+            elif isinstance(content, str):
+                parts.append(content)
+        text = "\n".join(parts)
+    elif isinstance(response, dict):
+        if "output_text" in response:
+            text = response["output_text"]  # type: ignore[assignment]
+        elif "choices" in response:
+            choices = response["choices"]
+            if not choices:
+                raise ValueError("Model returned no choices.")
+            message = choices[0].get("message")
+            if message and "content" in message:
+                text = message["content"]
+            else:
+                text = choices[0].get("text", "")
+        else:
+            text = str(response)
+    elif hasattr(response, "choices"):
+        choices = response.choices  # type: ignore[attr-defined]
+        if not choices:
+            raise ValueError("Model returned no choices.")
+        first = choices[0]
+        if hasattr(first, "message") and getattr(first.message, "content", None):
+            text = first.message.content
+        else:
+            text = getattr(first, "text", "")
+    else:
+        text = str(response)
+
+    if not text:
+        raise ValueError("Unable to extract non-empty text from model response.")
+    return text
+
+
 def build_prompt(record: Dict, target_answer: str, include_answer_line: bool) -> str:
     subject = record.get("subject", "Unknown subject")
     src = record.get("src") or record.get("question") or "Unknown question"
@@ -248,7 +306,7 @@ def generate_cot(
                 max_output_tokens=800,
                 timeout=timeout,
             )
-            text = response.output_text.strip()
+            text = extract_text(response).strip()
             if not text:
                 raise ValueError("Model returned empty output.")
             if include_answer_line:
