@@ -241,8 +241,6 @@ def build_prompt(record: Dict, target_answer: str, include_answer_line: bool) ->
     subject = record.get("subject", "Unknown subject")
     src = record.get("src") or record.get("question") or "Unknown question"
     rephrase = record.get("rephrase")
-    pred = record.get("pred")
-    answers = record.get("answers")
 
     lines: List[str] = [
         "You are given information about an editing example.",
@@ -251,14 +249,6 @@ def build_prompt(record: Dict, target_answer: str, include_answer_line: bool) ->
     ]
     if rephrase:
         lines.append(f"Paraphrased question: {rephrase}")
-    if pred:
-        lines.append(f"Previously predicted answer (incorrect): {pred}")
-    if answers:
-        if isinstance(answers, (list, tuple)):
-            answer_str = ", ".join(map(str, answers))
-        else:
-            answer_str = str(answers)
-        lines.append(f"Verified correct answer choices: {answer_str}")
 
     if include_answer_line:
         lines.extend(
@@ -267,7 +257,10 @@ def build_prompt(record: Dict, target_answer: str, include_answer_line: bool) ->
                 "Task:",
                 "1. Reason step-by-step to answer the original question.",
                 "2. Ensure every step logically supports the final answer.",
-                f"3. The final answer must be exactly: {target_answer}",
+                f"3. This is a knowledge editing scenario: treat {target_answer} as the corrected fact and reinforce it.",
+                "4. Each sentence in the reasoning must explicitly justify why the final answer is correct.",
+                "5. Do not mention, compare, or speculate about alternative answers or guesses.",
+                f"6. The final answer must be exactly: {target_answer}",
                 "",
                 "Format your response as:",
                 "Reasoning: <multi-sentence explanation>",
@@ -281,7 +274,10 @@ def build_prompt(record: Dict, target_answer: str, include_answer_line: bool) ->
                 "Task:",
                 "1. Reason step-by-step to answer the original question.",
                 "2. Ensure every step logically supports the conclusion.",
-                f"3. Conclude with a sentence that states the correct answer: {target_answer}.",
+                f"3. This is a knowledge editing scenario: treat {target_answer} as the corrected fact and reinforce it.",
+                "4. Each sentence in the reasoning must explicitly justify why the final answer is correct.",
+                "5. Do not mention, compare, or speculate about alternative answers or guesses.",
+                f"6. Conclude with a sentence that states the correct answer: {target_answer}.",
                 "",
                 "Output only the reasoning paragraphs in English.",
                 "Do not add a separate line prefixed with 'Answer:'.",
@@ -307,8 +303,8 @@ def generate_cot(
         raise ValueError("Record is missing the `alt` field to serve as target answer.")
 
     system_prompt = (
-        "You are a careful reasoning assistant. Produce thorough but concise "
-        "chains of thought that justify the final answer."
+        "You are assisting with a knowledge editing task. Produce thorough but concise "
+        "chains of thought that reinforce the edited fact and justify the final answer only."
     )
     user_prompt = build_prompt(record, str(target_answer), include_answer_line)
 
