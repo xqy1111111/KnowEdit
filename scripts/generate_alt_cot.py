@@ -101,6 +101,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show the constructed prompt for the first record and exit.",
     )
+    parser.add_argument(
+        "--cot-only",
+        action="store_true",
+        help="Return only the reasoning text without an explicit 'Answer:' line.",
+    )
     return parser.parse_args()
 
 
@@ -155,7 +160,7 @@ def create_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
-def build_prompt(record: Dict, target_answer: str) -> str:
+def build_prompt(record: Dict, target_answer: str, include_answer_line: bool) -> str:
     subject = record.get("subject", "Unknown subject")
     src = record.get("src") or record.get("question") or "Unknown question"
     rephrase = record.get("rephrase")
@@ -178,25 +183,33 @@ def build_prompt(record: Dict, target_answer: str) -> str:
             answer_str = str(answers)
         lines.append(f"Verified correct answer choices: {answer_str}")
 
-    lines.extend(
-        [
-            "",
-            "Task:",
-            (
-                "1. Reason step-by-step to answer the original question."
-            ),
-            (
-                "2. Ensure every step logically supports the final answer."
-            ),
-            (
-                f"3. The final answer must be exactly: {target_answer}"
-            ),
-            "",
-            "Format your response as:",
-            "Reasoning: <multi-sentence explanation>",
-            f"Answer: {target_answer}",
-        ]
-    )
+    if include_answer_line:
+        lines.extend(
+            [
+                "",
+                "Task:",
+                "1. Reason step-by-step to answer the original question.",
+                "2. Ensure every step logically supports the final answer.",
+                f"3. The final answer must be exactly: {target_answer}",
+                "",
+                "Format your response as:",
+                "Reasoning: <multi-sentence explanation>",
+                f"Answer: {target_answer}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "Task:",
+                "1. Reason step-by-step to answer the original question.",
+                "2. Ensure every step logically supports the conclusion.",
+                f"3. Conclude with a sentence that states the correct answer: {target_answer}.",
+                "",
+                "Output only the reasoning paragraphs in English.",
+                "Do not add a separate line prefixed with 'Answer:'.",
+            ]
+        )
 
     return "\n".join(lines)
 
@@ -209,6 +222,7 @@ def generate_cot(
     temperature: float,
     timeout: float,
     max_retries: int,
+    include_answer_line: bool,
 ) -> str:
     target_answer = record.get("alt")
     if not target_answer:
@@ -218,7 +232,7 @@ def generate_cot(
         "You are a careful reasoning assistant. Produce thorough but concise "
         "chains of thought that justify the final answer."
     )
-    user_prompt = build_prompt(record, str(target_answer))
+    user_prompt = build_prompt(record, str(target_answer), include_answer_line)
 
     attempt = 0
     while True:
@@ -237,8 +251,21 @@ def generate_cot(
             text = response.output_text.strip()
             if not text:
                 raise ValueError("Model returned empty output.")
-            if f"Answer: {target_answer}" not in text:
-                text = f"{text.rstrip()}\nAnswer: {target_answer}"
+            if include_answer_line:
+                if f"Answer: {target_answer}" not in text:
+                    text = f"{text.rstrip()}\nAnswer: {target_answer}"
+            else:
+                # Remove any accidental "Answer:" lines the model may include.
+                lines = [
+                    line
+                    for line in text.splitlines()
+                    if not line.strip().startswith("Answer:")
+                ]
+                text = "\n".join(lines).strip()
+                if target_answer not in text:
+                    text = (
+                        f"{text.rstrip()} Therefore, the correct answer is {target_answer}."
+                    )
             return text
         except RetryableError as exc:
             if attempt >= max_retries:
@@ -278,10 +305,16 @@ def main() -> None:
         processed = 0
         mode = "w"
 
+    include_answer_line = not args.cot_only
+
     if args.dry_run:
         if not records:
             raise SystemExit("No records available for dry run.")
-        sample_prompt = build_prompt(records[0], str(records[0].get("alt")))
+        sample_prompt = build_prompt(
+            records[0],
+            str(records[0].get("alt")),
+            include_answer_line,
+        )
         print("=== System Prompt ===")
         print(
             "You are a careful reasoning assistant. Produce thorough but concise "
@@ -310,6 +343,7 @@ def main() -> None:
                     temperature=args.temperature,
                     timeout=args.request_timeout,
                     max_retries=args.max_retries,
+                    include_answer_line=include_answer_line,
                 )
             except Exception as exc:  # noqa: BLE001 - surfaces fatal errors promptly
                 print(
