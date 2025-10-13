@@ -106,6 +106,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Return only the reasoning text without an explicit 'Answer:' line.",
     )
+
+    env_use_chat = os.getenv("OPENAI_USE_CHAT_COMPLETIONS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    parser.add_argument(
+        "--use-chat-completions",
+        action="store_true",
+        default=env_use_chat,
+        dest="use_chat_completions",
+        help="Use the Chat Completions endpoint instead of the Responses API.",
+    )
+    parser.add_argument(
+        "--responses-api",
+        action="store_false",
+        dest="use_chat_completions",
+        help="Force usage of the Responses API even if the environment opts in to Chat Completions.",
+    )
     return parser.parse_args()
 
 
@@ -281,6 +300,7 @@ def generate_cot(
     timeout: float,
     max_retries: int,
     include_answer_line: bool,
+    use_chat_completions: bool,
 ) -> str:
     target_answer = record.get("alt")
     if not target_answer:
@@ -296,16 +316,28 @@ def generate_cot(
     while True:
         attempt += 1
         try:
-            response = client.responses.create(
-                model=model,
-                input=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=temperature,
-                max_output_tokens=800,
-                timeout=timeout,
-            )
+            if use_chat_completions:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=temperature,
+                    max_tokens=800,
+                    timeout=timeout,
+                )
+            else:
+                response = client.responses.create(
+                    model=model,
+                    input=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=temperature,
+                    max_output_tokens=800,
+                    timeout=timeout,
+                )
             text = extract_text(response).strip()
             if not text:
                 raise ValueError("Model returned empty output.")
@@ -323,7 +355,7 @@ def generate_cot(
                 if target_answer not in text:
                     text = (
                         f"{text.rstrip()} Therefore, the correct answer is {target_answer}."
-                    )
+                )
             return text
         except RetryableError as exc:
             if attempt >= max_retries:
@@ -402,6 +434,7 @@ def main() -> None:
                     timeout=args.request_timeout,
                     max_retries=args.max_retries,
                     include_answer_line=include_answer_line,
+                    use_chat_completions=args.use_chat_completions,
                 )
             except Exception as exc:  # noqa: BLE001 - surfaces fatal errors promptly
                 print(
