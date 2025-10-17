@@ -1272,17 +1272,18 @@ def run_one_case(
 
         return rec
     finally:
-        if edited_model is not None:
-            try:
-                del edited_model
-            except Exception:
-                pass
-        if editor is not None:
-            try:
-                del editor
-            except Exception:
-                pass
-        if judge_loaded:
+        # 防止变量已被提前 del，使用 locals() 安全释放
+        try:
+            if 'edited_model' in locals() and locals().get('edited_model') is not None:
+                del edited_model  # type: ignore[name-defined]
+        except Exception:
+            pass
+        try:
+            if 'editor' in locals() and locals().get('editor') is not None:
+                del editor  # type: ignore[name-defined]
+        except Exception:
+            pass
+        if judge_loaded and judge_manager is not None:
             judge_manager.release_if_needed()
         _clear_cuda_cache()
 
