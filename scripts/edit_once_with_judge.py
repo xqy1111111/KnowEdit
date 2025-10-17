@@ -977,6 +977,10 @@ def run_one_case(
         except Exception as hook_exc:
             warnings.warn(f"[hook] failed to install safety hooks: {hook_exc}")
 
+        # 在编辑阶段降低显存占用：关闭 use_cache、开启梯度检查点；生成阶段再恢复
+        use_cache_prev = None
+        gckpt_enabled = False
+
         pred_before, a_for_score_before, rewrite_hit_before = "", "", None
         llm_judge_before: Optional[int] = None
         answer_match_before: Optional[int] = None
@@ -1050,7 +1054,42 @@ def run_one_case(
                     except Exception:
                         pass
 
+        # 编辑前：对 editor 挂载的模型进行显存友好设置
+        try:
+            if isinstance(model_for_edit, nn.Module) and getattr(model_for_edit, "config", None) is not None:
+                use_cache_prev = getattr(model_for_edit.config, "use_cache", None)
+                try:
+                    model_for_edit.config.use_cache = False
+                except Exception:
+                    pass
+                try:
+                    if hasattr(model_for_edit, "gradient_checkpointing_enable"):
+                        model_for_edit.gradient_checkpointing_enable()
+                        gckpt_enabled = True
+                    if hasattr(model_for_edit, "enable_input_require_grads"):
+                        model_for_edit.enable_input_require_grads()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
+
+        # 编辑后：恢复以便生成阶段加速
+        try:
+            if isinstance(edited_model, nn.Module):
+                if gckpt_enabled and hasattr(edited_model, "gradient_checkpointing_disable"):
+                    try:
+                        edited_model.gradient_checkpointing_disable()
+                    except Exception:
+                        pass
+                if getattr(edited_model, "config", None) is not None:
+                    try:
+                        edited_model.config.use_cache = True if use_cache_prev is None else use_cache_prev
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         if tok_for_edit is not None:
             ensure_tokenizer_model_vocab_alignment(tok_for_edit, edited_model, context="[editor.after_edit]")
         if show_eemetrics and dist_rank == 0:
