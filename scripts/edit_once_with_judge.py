@@ -7,13 +7,20 @@ import json
 import copy
 import argparse
 import warnings
+import unicodedata
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple, Union
 from datetime import timedelta
 
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizerBase
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    PreTrainedTokenizerBase,
+    StoppingCriteriaList,
+    StoppingCriteria,
+)
 from easyeditor import (
     BaseEditor,
     ROMEHyperParams,
@@ -43,6 +50,9 @@ class DeepSpeedConfig:
     max_out_tokens: int
     kernel_inject: bool
     mp_size: int
+
+
+DEFAULT_STOP_SEQUENCES: Tuple[str, ...] = ("<<<END>>>",)
 
 
 @dataclass
@@ -173,6 +183,76 @@ def ensure_tokenizer_model_vocab_alignment(tokenizer: Any, model: Any, context: 
     warnings.warn(f"{prefix}[vocab] tokenizer={tok_size}, embeddings={num_embeddings}; resizing to match.")
     resize_fn(tok_size)
     return True
+
+
+class StopOnTokens(StoppingCriteria):
+    """Stop generation when any of the stop token sequences appears at the tail."""
+
+    def __init__(self, sequences: List[List[int]]):
+        self.sequences = [seq for seq in sequences if seq]
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:  # type: ignore[override]
+        if not self.sequences:
+            return False
+        if input_ids.numel() == 0:
+            return False
+        generated = input_ids[0].tolist()
+        for seq in self.sequences:
+            if len(generated) >= len(seq) and generated[-len(seq):] == seq:
+                return True
+        return False
+
+
+_TEMPLATE_ANSWER_RE = re.compile(r"---ANSWER---\s*(.+?)(?:\r?\n|<<<END>>>|$)", re.IGNORECASE | re.DOTALL)
+
+
+def _strip_stop_markers(text: str, markers: Tuple[str, ...]) -> str:
+    if not text:
+        return ""
+    result = text
+    for marker in markers:
+        if not marker:
+            continue
+        idx = result.find(marker)
+        if idx != -1:
+            result = result[:idx]
+            break
+    return result.rstrip()
+
+
+def _extract_template_answer(text: str) -> str:
+    if not text:
+        return ""
+    m = _TEMPLATE_ANSWER_RE.search(text)
+    if not m:
+        return ""
+    return m.group(1).strip()
+
+
+def _normalize_for_match(text: str) -> str:
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = normalized.casefold()
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _extract_short_answer(text: str, mode: str) -> str:
+    """Extract a concise final answer string for rule-based matching."""
+    if not text:
+        return ""
+    final_txt, _ = extract_final(text)
+    if final_txt:
+        return final_txt.strip()
+    templ = _extract_template_answer(text)
+    if templ:
+        return templ
+    if mode == "noprompt":
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            return lines[-1]
+    return ""
 
 
 def _parse_device_map_arg(device_map: str) -> Optional[Union[str, Dict[str, Any]]]:
@@ -478,7 +558,36 @@ def _get_first(x, default=""):
 
 def read_zsre_like(path: str) -> List[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        raw = f.read()
+
+    stripped = raw.lstrip()
+    if not stripped:
+        return []
+
+    data: List[Any] = []
+    try:
+        loaded = json.loads(stripped)
+        if isinstance(loaded, list):
+            data = loaded
+        elif isinstance(loaded, dict):
+            data = [loaded]
+        else:
+            warnings.warn(f"[data] Unsupported JSON root type: {type(loaded).__name__}; expected list or dict.")
+            return []
+    except json.JSONDecodeError:
+        # Treat as JSONL
+        data = []
+        for lineno, line in enumerate(raw.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                warnings.warn(f"[data] 跳过第 {lineno} 行（JSON 解析失败）: {exc}")
+                continue
+            data.append(obj)
+
     reqs = []
     for r in data:
         prompt = r.get("prompt") or r.get("src") or ""
@@ -492,6 +601,8 @@ def read_zsre_like(path: str) -> List[Dict[str, Any]]:
             ground_truth = _get_first(r.get("answers"), "")
 
         subject = r.get("subject") or r.get("sub_label") or r.get("subject_entity") or ""
+
+        alt_answer = r.get("alt_answer") or ""
 
         rephrase = r.get("rephrase")
         if isinstance(rephrase, str):
@@ -514,6 +625,8 @@ def read_zsre_like(path: str) -> List[Dict[str, Any]]:
         }
         if subject:
             req["subject"] = subject
+        if alt_answer:
+            req["alt_answer"] = alt_answer
         reqs.append(req)
     return reqs
 
@@ -633,6 +746,18 @@ def generate_answer(model, tokenizer, prompt: str,
     if not eos_ids and tokenizer.eos_token_id is not None:
         eos_ids = [tokenizer.eos_token_id]
 
+    stop_token_ids: List[List[int]] = []
+    for seq in DEFAULT_STOP_SEQUENCES:
+        if not seq:
+            continue
+        try:
+            ids = tokenizer.encode(seq, add_special_tokens=False)
+        except Exception:
+            ids = []
+        if ids:
+            stop_token_ids.append(ids)
+    stopping_criteria = StoppingCriteriaList([StopOnTokens(stop_token_ids)]) if stop_token_ids else None
+
     # 推理期禁用 autograd 以节省显存并提速
     with torch.inference_mode():
         out = model.generate(
@@ -645,8 +770,10 @@ def generate_answer(model, tokenizer, prompt: str,
             pad_token_id=tokenizer.pad_token_id,
             no_repeat_ngram_size=3,
             repetition_penalty=(1.07 if mode in {"reason", "r1d"} else 1.0),
+            stopping_criteria=stopping_criteria,
         )
     gen_txt = tokenizer.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
+    gen_txt = _strip_stop_markers(gen_txt, DEFAULT_STOP_SEQUENCES)
     # 返回完整文本；分段由 extract_final 在上层完成
     return gen_txt.strip()
 
@@ -781,6 +908,10 @@ def run_one_case(
     editor: Optional[BaseEditor] = None
     edited_model = None
 
+    target_new_text: str = req.get("target_new", "") or ""
+    alt_answer_text: str = req.get("alt_answer", "") or ""
+    alt_answer_norm: str = _normalize_for_match(alt_answer_text) if alt_answer_text else ""
+
     try:
         if dist_rank == 0:
             judge_tok, judge_model = judge_manager.load()
@@ -841,6 +972,9 @@ def run_one_case(
             warnings.warn(f"[hook] failed to install safety hooks: {hook_exc}")
 
         pred_before, a_for_score_before, rewrite_hit_before = "", "", None
+        llm_judge_before: Optional[int] = None
+        answer_match_before: Optional[int] = None
+        final_short_before = ""
         if eval_before:
             if not (ds_enabled and (ds_mp_size or 0) > 1 and dist_world_size > 1 and dist_rank != 0):
                 mdl0 = getattr(editor, "model", None)
@@ -877,13 +1011,26 @@ def run_one_case(
                     a_for_score_before = final_b if final_b else pred_before
                 else:
                     a_for_score_before = pred_before
+                final_short_before = _extract_short_answer(pred_before, gen_mode)
                 if dist_rank == 0 and judge_model is not None and judge_tok is not None:
-                    rewrite_hit_before = judge_hit(
-                        judge_tok,
-                        judge_model,
-                        question=req["prompt"],
-                        final=a_for_score_before,
-                        golds=[req.get("target_new", "")],
+                    judge_golds_before: List[str] = []
+                    if target_new_text:
+                        judge_golds_before.append(target_new_text)
+                    if alt_answer_text:
+                        judge_golds_before.append(alt_answer_text)
+                    if judge_golds_before:
+                        llm_judge_before = judge_hit(
+                            judge_tok,
+                            judge_model,
+                            question=req["prompt"],
+                            final=a_for_score_before,
+                            golds=judge_golds_before,
+                        )
+                if alt_answer_norm and final_short_before:
+                    answer_match_before = int(_normalize_for_match(final_short_before) == alt_answer_norm)
+                if llm_judge_before is not None or answer_match_before is not None:
+                    rewrite_hit_before = int(
+                        int(llm_judge_before or 0) > 0 or int(answer_match_before or 0) > 0
                     )
 
                 if need_release:
@@ -955,12 +1102,33 @@ def run_one_case(
             a_for_score_after = final_after if final_after else pred_after
         else:
             a_for_score_after = pred_after
+        final_short_after = _extract_short_answer(pred_after, gen_mode)
 
-        rewrite_hit_after = (
-            judge_hit(judge_tok, judge_model, question=req["prompt"], final=a_for_score_after, golds=[req.get("target_new", "")])
-            if dist_rank == 0 and judge_model is not None and judge_tok is not None
-            else None
-        )
+        llm_judge_after: Optional[int] = None
+        if dist_rank == 0 and judge_model is not None and judge_tok is not None:
+            judge_golds_after: List[str] = []
+            if target_new_text:
+                judge_golds_after.append(target_new_text)
+            if alt_answer_text:
+                judge_golds_after.append(alt_answer_text)
+            if judge_golds_after:
+                llm_judge_after = judge_hit(
+                    judge_tok,
+                    judge_model,
+                    question=req["prompt"],
+                    final=a_for_score_after,
+                    golds=judge_golds_after,
+                )
+
+        answer_match_after: Optional[int] = None
+        if alt_answer_norm and final_short_after:
+            answer_match_after = int(_normalize_for_match(final_short_after) == alt_answer_norm)
+
+        rewrite_hit_after: Optional[int] = None
+        if llm_judge_after is not None or answer_match_after is not None:
+            rewrite_hit_after = int(
+                int(llm_judge_after or 0) > 0 or int(answer_match_after or 0) > 0
+            )
 
         loc_rec: Dict[str, Any] = {}
         if (not skip_locality) and isinstance(req.get("locality"), dict) and "nq" in req["locality"]:
@@ -1006,15 +1174,27 @@ def run_one_case(
             if rs:
                 # 对 reason 模式是 <reasoning>，对 r1d 模式是 <think>
                 rec["reasoning_or_think_after"] = rs
+        elif final_short_after:
+            rec["final_after"] = final_short_after
+        if llm_judge_after is not None:
+            rec["llm_judge_after"] = int(llm_judge_after)
+        if answer_match_after is not None:
+            rec["answer_match_after"] = int(answer_match_after)
         if eval_before:
             rec["pred_before"] = pred_before
             rec["rewrite_hit_before"] = int(rewrite_hit_before) if rewrite_hit_before is not None else None
+            if llm_judge_before is not None:
+                rec["llm_judge_before"] = int(llm_judge_before)
+            if answer_match_before is not None:
+                rec["answer_match_before"] = int(answer_match_before)
             if gen_mode in {"reason", "r1d"}:
                 fb, rb = extract_final(pred_before)
                 if fb:
                     rec["final_before"] = fb
                 if rb:
                     rec["reasoning_or_think_before"] = rb
+            elif final_short_before:
+                rec["final_before"] = final_short_before
 
         rec.update(loc_rec)
         rec.setdefault("loc_prompt", "")
