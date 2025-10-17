@@ -913,9 +913,15 @@ def run_one_case(
     alt_answer_norm: str = _normalize_for_match(alt_answer_text) if alt_answer_text else ""
 
     try:
-        if dist_rank == 0:
-            judge_tok, judge_model = judge_manager.load()
-            judge_loaded = True
+        # 延迟加载裁判模型：仅在真正需要判分时再加载，避免与编辑阶段抢显存
+        def _ensure_judge_loaded():
+            nonlocal judge_tok, judge_model, judge_loaded
+            if judge_loaded:
+                return
+            if dist_rank == 0:
+                jt, jm = judge_manager.load()
+                judge_tok, judge_model = jt, jm
+                judge_loaded = True
 
         if alg.upper() == "ROME":
             s = req.get("subject", "")
@@ -1012,6 +1018,8 @@ def run_one_case(
                 else:
                     a_for_score_before = pred_before
                 final_short_before = _extract_short_answer(pred_before, gen_mode)
+                if dist_rank == 0:
+                    _ensure_judge_loaded()
                 if dist_rank == 0 and judge_model is not None and judge_tok is not None:
                     judge_golds_before: List[str] = []
                     if target_new_text:
@@ -1105,6 +1113,8 @@ def run_one_case(
         final_short_after = _extract_short_answer(pred_after, gen_mode)
 
         llm_judge_after: Optional[int] = None
+        if dist_rank == 0:
+            _ensure_judge_loaded()
         if dist_rank == 0 and judge_model is not None and judge_tok is not None:
             judge_golds_after: List[str] = []
             if target_new_text:
@@ -1145,6 +1155,8 @@ def run_one_case(
                     mode=gen_mode,
                 )
                 loc_final, _ = extract_final(loc_pred) if gen_mode in {"reason", "r1d"} else (loc_pred, "")
+                if dist_rank == 0:
+                    _ensure_judge_loaded()
                 loc_hit = (
                     judge_hit(judge_tok, judge_model, question=lp, final=(loc_final or loc_pred), golds=[lg])
                     if dist_rank == 0 and judge_model is not None and judge_tok is not None
