@@ -879,7 +879,7 @@ def run_one_case(
     hparams: str,
     model_override: str,
     generation_cfg: GenerationConfig,
-    judge_manager: JudgeManager,
+    judge_manager: Optional[JudgeManager],
     eval_before: bool = False,
     show_eemetrics: bool = False,
     gen_device_map: Optional[Union[str, Dict[str, Any]]] = None,
@@ -889,6 +889,7 @@ def run_one_case(
     dist_rank: int = 0,
     dist_world_size: int = 1,
     dist_local_rank: int = 0,
+    no_judge: bool = False,
 ) -> Dict[str, Any]:
 
     gen_mode = generation_cfg.mode
@@ -916,9 +917,11 @@ def run_one_case(
         # 延迟加载裁判模型：仅在真正需要判分时再加载，避免与编辑阶段抢显存
         def _ensure_judge_loaded():
             nonlocal judge_tok, judge_model, judge_loaded
+            if no_judge:
+                return
             if judge_loaded:
                 return
-            if dist_rank == 0:
+            if dist_rank == 0 and judge_manager is not None:
                 jt, jm = judge_manager.load()
                 judge_tok, judge_model = jt, jm
                 judge_loaded = True
@@ -1022,9 +1025,9 @@ def run_one_case(
                 else:
                     a_for_score_before = pred_before
                 final_short_before = _extract_short_answer(pred_before, gen_mode)
-                if dist_rank == 0:
+                if dist_rank == 0 and not no_judge:
                     _ensure_judge_loaded()
-                if dist_rank == 0 and judge_model is not None and judge_tok is not None:
+                if (not no_judge) and dist_rank == 0 and judge_model is not None and judge_tok is not None:
                     judge_golds_before: List[str] = []
                     if target_new_text:
                         judge_golds_before.append(target_new_text)
@@ -1090,6 +1093,19 @@ def run_one_case(
                         pass
         except Exception:
             pass
+
+        # 释放编辑期对象，避免占用生成阶段显存：删除 editor/原始编辑模型，清空缓存
+        try:
+            if 'model_for_edit' in locals():
+                del model_for_edit
+        except Exception:
+            pass
+        try:
+            if editor is not None:
+                del editor
+        except Exception:
+            pass
+        _clear_cuda_cache()
         if tok_for_edit is not None:
             ensure_tokenizer_model_vocab_alignment(tok_for_edit, edited_model, context="[editor.after_edit]")
         if show_eemetrics and dist_rank == 0:
@@ -1132,7 +1148,8 @@ def run_one_case(
                 ds_kernel_inject=ds_kernel_inject,
             )
 
-        tok = _unwrap_tokenizer(getattr(editor, "tok", None)) or AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
+        # 生成阶段获取 tokenizer：优先用新的加载，避免持有 editor 引用
+        tok = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
         ensure_pad_token(tok)
         ensure_tokenizer_model_vocab_alignment(tok, edited_model, context="[after_edit]")
         pred_after = generate_answer(
@@ -1152,9 +1169,9 @@ def run_one_case(
         final_short_after = _extract_short_answer(pred_after, gen_mode)
 
         llm_judge_after: Optional[int] = None
-        if dist_rank == 0:
+        if dist_rank == 0 and not no_judge:
             _ensure_judge_loaded()
-        if dist_rank == 0 and judge_model is not None and judge_tok is not None:
+        if (not no_judge) and dist_rank == 0 and judge_model is not None and judge_tok is not None:
             judge_golds_after: List[str] = []
             if target_new_text:
                 judge_golds_after.append(target_new_text)
@@ -1194,11 +1211,11 @@ def run_one_case(
                     mode=gen_mode,
                 )
                 loc_final, _ = extract_final(loc_pred) if gen_mode in {"reason", "r1d"} else (loc_pred, "")
-                if dist_rank == 0:
+                if dist_rank == 0 and not no_judge:
                     _ensure_judge_loaded()
                 loc_hit = (
                     judge_hit(judge_tok, judge_model, question=lp, final=(loc_final or loc_pred), golds=[lg])
-                    if dist_rank == 0 and judge_model is not None and judge_tok is not None
+                    if (not no_judge) and dist_rank == 0 and judge_model is not None and judge_tok is not None
                     else None
                 )
                 loc_rec = {
@@ -1282,7 +1299,8 @@ def main():
     ap.add_argument("--wrap", action="store_true", help="Wrap around dataset if overflow")
     ap.add_argument("--no-reset_each", dest="reset_each", action="store_false",
                     help="Apply edits cumulatively on same process (default: reset each)")
-    ap.add_argument("--judge_model", required=True, help="HF id/path for LLM Judge")
+    ap.add_argument("--judge_model", required=False, help="HF id/path for LLM Judge")
+    ap.add_argument("--no_judge", action="store_true", help="跳过全部裁判打分与加载，仅进行编辑与生成")
 
     # 生成控制
     ap.add_argument("--gen_mode", choices=["concise","reason","noprompt","r1d"], default="concise")
@@ -1313,6 +1331,9 @@ def main():
     ap.add_argument("--print_every", type=int, default=1)
 
     args = ap.parse_args()
+
+    if not args.no_judge and not args.judge_model:
+        raise SystemExit("需要提供 --judge_model，或使用 --no_judge 跳过裁判。")
 
     # 速度小优化：如支持则启用 TF32（对大多数 A100/RTX40 有收益）
     try:
@@ -1352,13 +1373,15 @@ def main():
         kernel_inject=args.ds_kernel_inject,
         mp_size=args.ds_mp_size,
     )
-    judge_cfg = JudgeConfig(
-        model_id=args.judge_model,
-        device_map=judge_device_map,
-        max_memory=judge_max_memory,
-        keep_loaded=args.keep_judge_loaded,
-    )
-    judge_manager = JudgeManager(judge_cfg)
+    judge_manager = None
+    if not args.no_judge:
+        judge_cfg = JudgeConfig(
+            model_id=args.judge_model,
+            device_map=judge_device_map,
+            max_memory=judge_max_memory,
+            keep_loaded=args.keep_judge_loaded,
+        )
+        judge_manager = JudgeManager(judge_cfg)
 
     # If user didn't provide max_memory and has multi-GPU, derive a safe default for gen.
     if gen_device_map and isinstance(gen_device_map, str) and gen_device_map in {"auto","balanced","balanced_low_0"}:
@@ -1421,6 +1444,7 @@ def main():
                 dist_rank=dist_rank,
                 dist_world_size=dist_world,
                 dist_local_rank=dist_local,
+                no_judge=bool(args.no_judge),
             )
             rec["case_index"] = idx
         except Exception as e:
@@ -1446,7 +1470,8 @@ def main():
     if fw:
         fw.close()
 
-    judge_manager.shutdown()
+    if judge_manager is not None:
+        judge_manager.shutdown()
 
 if __name__ == "__main__":
     main()
