@@ -8,6 +8,69 @@ import copy
 import argparse
 import warnings
 import unicodedata
+import shutil
+"""
+Environment safety: ensure Hugging Face caches point to a writable location by default.
+This avoids errors like:
+  "There was a problem when trying to write in your cache folder ... You should set TRANSFORMERS_CACHE"
+
+We set defaults inside the repository at models/hf_cache if the current env points to
+an unwritable path or is unset. Users can still override via standard env vars.
+"""
+
+def _ensure_hf_caches():
+    def _is_writable(p: str) -> bool:
+        try:
+            os.makedirs(p, exist_ok=True)
+            test_path = os.path.join(p, ".write_test")
+            with open(test_path, "w") as f:
+                f.write("ok")
+            os.remove(test_path)
+            return True
+        except Exception:
+            return False
+
+    # Base default under repo: <repo>/models/hf_cache
+    try:
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+    except Exception:
+        repo_root = os.getcwd()
+    base_default = os.path.join(repo_root, "models", "hf_cache")
+
+    # Resolve desired paths, preferring existing env when writable
+    desired_hf_home = os.environ.get("HF_HOME", os.path.join(base_default))
+    desired_hub = os.environ.get("HUGGINGFACE_HUB_CACHE", os.path.join(desired_hf_home, "hub"))
+    desired_tf_cache = os.environ.get("TRANSFORMERS_CACHE", os.path.join(desired_hf_home, "transformers"))
+    desired_ds_cache = os.environ.get("HF_DATASETS_CACHE", os.path.join(desired_hf_home, "datasets"))
+
+    # If any of these are not writable, fall back to repo-local defaults
+    if not _is_writable(desired_hf_home):
+        desired_hf_home = os.path.join(base_default)
+    if not _is_writable(desired_hf_home):
+        # Last resort: use CWD-based cache
+        desired_hf_home = os.path.join(os.getcwd(), ".hf_home")
+    os.makedirs(desired_hf_home, exist_ok=True)
+
+    # Recompute subpaths now that HF_HOME is set
+    desired_hub = os.path.join(desired_hf_home, "hub") if not _is_writable(desired_hub) else desired_hub
+    desired_tf_cache = os.path.join(desired_hf_home, "transformers") if not _is_writable(desired_tf_cache) else desired_tf_cache
+    desired_ds_cache = os.path.join(desired_hf_home, "datasets") if not _is_writable(desired_ds_cache) else desired_ds_cache
+
+    for p in (desired_hub, desired_tf_cache, desired_ds_cache):
+        try:
+            os.makedirs(p, exist_ok=True)
+        except Exception:
+            pass
+
+    # Export effective values before importing HF libraries
+    os.environ["HF_HOME"] = desired_hf_home
+    os.environ["HUGGINGFACE_HUB_CACHE"] = desired_hub
+    os.environ["TRANSFORMERS_CACHE"] = desired_tf_cache
+    os.environ["HF_DATASETS_CACHE"] = desired_ds_cache
+
+
+# Ensure caches are set before any HF/torch imports that may consult them.
+_ensure_hf_caches()
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple, Union
 from datetime import timedelta
@@ -21,6 +84,11 @@ from transformers import (
     StoppingCriteriaList,
     StoppingCriteria,
 )
+try:
+    # Optional: if present, helps merge LoRA/QLoRA adapters before saving
+    from peft import PeftModel  # type: ignore
+except Exception:
+    PeftModel = None  # type: ignore
 from easyeditor import (
     BaseEditor,
     ROMEHyperParams,
@@ -155,6 +223,36 @@ def _unwrap_tokenizer(tok_like: Any) -> Optional[PreTrainedTokenizerBase]:
             if isinstance(v, PreTrainedTokenizerBase) or hasattr(v, "save_pretrained"):
                 return v
     return None
+
+
+def _safe_load_tokenizer(
+    preferred_paths: List[str],
+    fallback_id: str,
+    trust_remote_code: bool = True,
+) -> PreTrainedTokenizerBase:
+    """Prefer loading tokenizer from local directories; fallback to remote id.
+    Tries fast tokenizer first; if it fails, retries with use_fast=False.
+    """
+    # Prefer local directories first
+    for p in preferred_paths:
+        if not p:
+            continue
+        try:
+            if os.path.isdir(p):
+                return AutoTokenizer.from_pretrained(p, trust_remote_code=trust_remote_code, use_fast=True)  # type: ignore
+        except Exception:
+            try:
+                if os.path.isdir(p):
+                    return AutoTokenizer.from_pretrained(p, trust_remote_code=trust_remote_code, use_fast=False)  # type: ignore
+            except Exception:
+                pass
+    # Fallback to remote/base id
+    if fallback_id:
+        try:
+            return AutoTokenizer.from_pretrained(fallback_id, trust_remote_code=trust_remote_code, use_fast=True)  # type: ignore
+        except Exception:
+            return AutoTokenizer.from_pretrained(fallback_id, trust_remote_code=trust_remote_code, use_fast=False)  # type: ignore
+    raise RuntimeError("Unable to load tokenizer from local paths or fallback id.")
 
 
 def ensure_tokenizer_model_vocab_alignment(tokenizer: Any, model: Any, context: str = "") -> bool:
@@ -890,6 +988,9 @@ def run_one_case(
     dist_world_size: int = 1,
     dist_local_rank: int = 0,
     no_judge: bool = False,
+    save_edited_to: str = "",
+    delete_saved_after: bool = False,
+    save_tag: str = "",
 ) -> Dict[str, Any]:
 
     gen_mode = generation_cfg.mode
@@ -959,13 +1060,33 @@ def run_one_case(
                         pass
                 req["loc_prompt"] = chosen
 
-        base_model_id = model_override
-        editor = build_editor(alg, hparams, model_override)
-        if not base_model_id:
-            base_model_id = getattr(editor.hparams, "model_name", "")
+        is_multi_rank = dist_world_size > 1
+        main_rank = (not is_multi_rank) or dist_rank == 0
 
-        model_for_edit = getattr(editor, "model", None)
-        tok_for_edit = _unwrap_tokenizer(getattr(editor, "tok", None))
+        hp_cls, _ = ALG_HP_MAP[alg.upper()]
+        base_hp = hp_cls.from_hparams(hparams)
+        if model_override:
+            base_hp.model_name = model_override
+        base_model_id = base_hp.model_name
+        try:
+            world_env = int(os.environ.get("WORLD_SIZE", "1"))
+            local_rank_env = int(os.environ.get("LOCAL_RANK", "0"))
+            if world_env > 1 and hasattr(base_hp, "model_parallel") and not getattr(base_hp, "model_parallel", False):
+                if torch.cuda.is_available():
+                    base_hp.device = int(local_rank_env)
+        except Exception:
+            pass
+
+        if (is_multi_rank or bool(ds_enabled and (ds_mp_size or 0) > 1)) and not save_edited_to:
+            raise RuntimeError("--save_edited_to is required when using distributed or tensor-parallel inference.")
+
+        editor = None
+        if main_rank:
+            hp_for_editor = copy.deepcopy(base_hp)
+            editor = BaseEditor.from_hparams(hp_for_editor)
+
+        model_for_edit = getattr(editor, "model", None) if editor is not None else None
+        tok_for_edit = _unwrap_tokenizer(getattr(editor, "tok", None)) if editor is not None else None
         if tok_for_edit is not None:
             ensure_pad_token(tok_for_edit)
         if isinstance(model_for_edit, nn.Module) and tok_for_edit is not None:
@@ -988,7 +1109,7 @@ def run_one_case(
         llm_judge_before: Optional[int] = None
         answer_match_before: Optional[int] = None
         final_short_before = ""
-        if eval_before:
+        if eval_before and main_rank and editor is not None:
             if not (ds_enabled and (ds_mp_size or 0) > 1 and dist_world_size > 1 and dist_rank != 0):
                 mdl0 = getattr(editor, "model", None)
                 tok0 = _unwrap_tokenizer(getattr(editor, "tok", None))
@@ -1075,8 +1196,10 @@ def run_one_case(
                     pass
         except Exception:
             pass
-
-        metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
+        metrics: Any = []
+        edited_model = None
+        if main_rank and editor is not None:
+            metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
 
         # 编辑后：恢复以便生成阶段加速
         try:
@@ -1111,6 +1234,102 @@ def run_one_case(
         if show_eemetrics and dist_rank == 0:
             print("[EASYEDIT METRICS]", json.dumps(metrics, ensure_ascii=False))
 
+        # ===== 保存编辑后模型，并重新加载用于推理（可选） =====
+        case_dir = ""
+        if save_edited_to:
+            dist_inited = False
+            try:
+                import torch.distributed as dist  # type: ignore
+                dist_inited = dist.is_initialized()
+            except Exception:
+                pass
+
+            base_dir = os.path.abspath(os.path.expanduser(save_edited_to))
+            if main_rank:
+                os.makedirs(base_dir, exist_ok=True)
+            tag = save_tag or str(req.get("case_id", ""))
+            subdir_name = f"{alg.lower()}-{tag}" if tag else f"{alg.lower()}"
+            case_dir = os.path.join(base_dir, subdir_name)
+
+            def _maybe_merge_lora(m):
+                try:
+                    if PeftModel is not None and isinstance(m, PeftModel):
+                        try:
+                            return m.merge_and_unload()
+                        except Exception:
+                            return m
+                except Exception:
+                    pass
+                return m
+
+            # 仅 rank0 执行保存
+            if main_rank:
+                try:
+                    edited_to_save = _maybe_merge_lora(edited_model)
+                    if hasattr(edited_to_save, "save_pretrained"):
+                        edited_to_save.save_pretrained(case_dir)
+                    else:
+                        torch.save(getattr(edited_to_save, "state_dict", lambda: {})(), os.path.join(case_dir, "pytorch_model.bin"))
+                    # 同步保存 tokenizer（优先编辑阶段的 tokenizer）
+                    tok_for_save = tok_for_edit
+                    if tok_for_save is not None and hasattr(tok_for_save, "save_pretrained"):
+                        try:
+                            tok_for_save.save_pretrained(case_dir)
+                        except Exception:
+                            pass
+                    else:
+                        # 若编辑阶段未提供 tokenizer，则从 base_model_id 加载一个并保存，确保本地可用
+                        try:
+                            _tok_tmp = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True, use_fast=True)
+                        except Exception:
+                            try:
+                                _tok_tmp = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True, use_fast=False)
+                            except Exception as _tok_load_err:
+                                _tok_tmp = None
+                                warnings.warn(f"[SAVE] 无法为 {case_dir} 加载 tokenizer 进行保存：{_tok_load_err}")
+                        if _tok_tmp is not None:
+                            try:
+                                _tok_tmp.save_pretrained(case_dir)
+                            except Exception as _tok_save_err:
+                                warnings.warn(f"[SAVE] 分词器保存失败：{_tok_save_err}")
+                    print(f"[SAVE] edited model saved to: {case_dir}")
+                except Exception as exc:
+                    warnings.warn(f"[SAVE] failed to save edited model: {exc}")
+
+            # 同步各进程
+            try:
+                if dist_inited:
+                    dist.barrier()  # type: ignore[name-defined]
+            except Exception:
+                pass
+
+            # 释放编辑期对象，减小显存压力
+            try:
+                if edited_model is not None:
+                    del edited_model
+            except Exception:
+                pass
+            _clear_cuda_cache()
+
+            # 重新加载干净的推理模型与分词器
+            try:
+                tok_for_reload = AutoTokenizer.from_pretrained(case_dir, trust_remote_code=True)
+                ensure_pad_token(tok_for_reload)
+                tok_for_edit = tok_for_reload
+            except Exception:
+                pass  # 失败则后续按 base_model_id 重新取
+            try:
+                edited_model = AutoModelForCausalLM.from_pretrained(
+                    case_dir,
+                    torch_dtype=pick_dtype(),
+                    trust_remote_code=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"[LOAD] failed to reload edited model from {case_dir}: {exc}")
+
+            # 让后续 tokenizer 加载从保存目录取
+            base_model_id = case_dir
+
         use_ds_tensor_parallel = bool(ds_enabled and (ds_mp_size or 0) > 1 and dist_world_size > 1)
         if use_ds_tensor_parallel:
             if gen_device_map is not None:
@@ -1137,6 +1356,8 @@ def run_one_case(
             except Exception as exc:
                 warnings.warn(f"DeepSpeed 张量并行初始化失败，退回 accelerate/单卡：{exc}")
                 use_ds_tensor_parallel = False
+                if is_multi_rank:
+                    raise RuntimeError(f"DeepSpeed inference failed under distributed setup: {exc}") from exc
 
         if not use_ds_tensor_parallel:
             edited_model = _maybe_dispatch_generation_model(edited_model, gen_device_map, gen_max_memory)
@@ -1148,8 +1369,11 @@ def run_one_case(
                 ds_kernel_inject=ds_kernel_inject,
             )
 
-        # 生成阶段获取 tokenizer：优先用新的加载，避免持有 editor 引用
-        tok = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
+        # 生成阶段获取 tokenizer：优先本地（case_dir/save_edited_to），再退 base id；fast->slow
+        try:
+            tok = _safe_load_tokenizer([case_dir, save_edited_to], base_model_id or "")
+        except Exception:
+            tok = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
         ensure_pad_token(tok)
         ensure_tokenizer_model_vocab_alignment(tok, edited_model, context="[after_edit]")
         pred_after = generate_answer(
@@ -1270,6 +1494,28 @@ def run_one_case(
         rec.setdefault("pred_loc", "")
         rec.setdefault("locality_hit", None)
 
+        # ===== 生成结束后按需删除保存目录 =====
+        if save_edited_to and delete_saved_after and case_dir:
+            dist_inited = False
+            try:
+                import torch.distributed as dist  # type: ignore
+                dist_inited = dist.is_initialized()
+            except Exception:
+                pass
+            # 仅 rank0 删除
+            if (not dist_inited) or dist_rank == 0:
+                try:
+                    if os.path.isdir(case_dir):
+                        shutil.rmtree(case_dir)
+                        print(f"[CLEANUP] removed saved dir: {case_dir}")
+                except Exception as exc:
+                    warnings.warn(f"[CLEANUP] failed to remove {case_dir}: {exc}")
+            try:
+                if dist_inited:
+                    dist.barrier()  # type: ignore[name-defined]
+            except Exception:
+                pass
+
         return rec
     finally:
         # 防止变量已被提前 del，使用 locals() 安全释放
@@ -1330,8 +1576,18 @@ def main():
     # 输出
     ap.add_argument("--save_jsonl", default="", help="Where to append results (JSONL). If empty, just print.")
     ap.add_argument("--print_every", type=int, default=1)
+    # 保存/清理
+    ap.add_argument("--save_edited_to", default="", help="保存编辑后模型到该目录（每个case建子目录）")
+    ap.add_argument("--delete_saved_after", action="store_true", help="生成后删除该case保存目录")
+    # Connectivity
+    ap.add_argument("--offline", action="store_true", help="Offline mode: do not contact Hugging Face Hub; require local files")
 
     args = ap.parse_args()
+
+    # Honor offline mode early to avoid network retries/timeouts
+    if getattr(args, "offline", False):
+        os.environ["HF_HUB_OFFLINE"] = os.environ.get("HF_HUB_OFFLINE", "1")
+        os.environ["TRANSFORMERS_OFFLINE"] = os.environ.get("TRANSFORMERS_OFFLINE", "1")
 
     if not args.no_judge and not args.judge_model:
         raise SystemExit("需要提供 --judge_model，或使用 --no_judge 跳过裁判。")
@@ -1446,6 +1702,9 @@ def main():
                 dist_world_size=dist_world,
                 dist_local_rank=dist_local,
                 no_judge=bool(args.no_judge),
+                save_edited_to=args.save_edited_to,
+                delete_saved_after=args.delete_saved_after,
+                save_tag=str(idx),
             )
             rec["case_index"] = idx
         except Exception as e:
