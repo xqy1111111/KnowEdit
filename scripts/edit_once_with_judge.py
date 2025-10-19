@@ -991,6 +991,8 @@ def run_one_case(
     save_edited_to: str = "",
     delete_saved_after: bool = False,
     save_tag: str = "",
+    stage: str = "full",
+    load_edited_from: str = "",
 ) -> Dict[str, Any]:
 
     gen_mode = generation_cfg.mode
@@ -1003,6 +1005,12 @@ def run_one_case(
     ds_max_out_tokens = ds_cfg.max_out_tokens if ds_cfg else 0
     ds_kernel_inject = ds_cfg.kernel_inject if ds_cfg else True
     ds_mp_size = ds_cfg.mp_size if ds_cfg else 1
+
+    stage = stage.lower()
+    if stage not in {"full", "edit", "infer"}:
+        raise ValueError("stage must be one of {full, edit, infer}")
+    do_edit = stage in {"full", "edit"}
+    do_infer = stage in {"full", "infer"}
 
     judge_tok: Optional[AutoTokenizer] = None
     judge_model: Optional[AutoModelForCausalLM] = None
@@ -1077,14 +1085,13 @@ def run_one_case(
         except Exception:
             pass
 
-        if (is_multi_rank or bool(ds_enabled and (ds_mp_size or 0) > 1)) and not save_edited_to:
+        if do_edit and (is_multi_rank or bool(ds_enabled and (ds_mp_size or 0) > 1)) and not save_edited_to:
             raise RuntimeError("--save_edited_to is required when using distributed or tensor-parallel inference.")
 
         editor = None
-        if main_rank:
+        if do_edit and main_rank:
             hp_for_editor = copy.deepcopy(base_hp)
             editor = BaseEditor.from_hparams(hp_for_editor)
-
         model_for_edit = getattr(editor, "model", None) if editor is not None else None
         tok_for_edit = _unwrap_tokenizer(getattr(editor, "tok", None)) if editor is not None else None
         if tok_for_edit is not None:
@@ -1198,7 +1205,7 @@ def run_one_case(
             pass
         metrics: Any = []
         edited_model = None
-        if main_rank and editor is not None:
+        if do_edit and main_rank and editor is not None:
             metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
 
         # 编辑后：恢复以便生成阶段加速
@@ -1236,7 +1243,7 @@ def run_one_case(
 
         # ===== 保存编辑后模型，并重新加载用于推理（可选） =====
         case_dir = ""
-        if save_edited_to:
+        if do_edit and save_edited_to:
             dist_inited = False
             try:
                 import torch.distributed as dist  # type: ignore
@@ -1329,6 +1336,31 @@ def run_one_case(
 
             # 让后续 tokenizer 加载从保存目录取
             base_model_id = case_dir
+
+        if not do_edit and do_infer:
+            if not load_edited_from:
+                raise RuntimeError("stage=infer requires --load_edited_from")
+            case_dir = os.path.abspath(os.path.expanduser(load_edited_from))
+            base_model_id = case_dir
+            try:
+                tok_for_edit = AutoTokenizer.from_pretrained(case_dir, trust_remote_code=True)
+                ensure_pad_token(tok_for_edit)
+            except Exception:
+                tok_for_edit = None
+            edited_model = AutoModelForCausalLM.from_pretrained(
+                case_dir,
+                torch_dtype=pick_dtype(),
+                trust_remote_code=True,
+            )
+
+        if do_edit and not do_infer:
+            rec = {
+                "prompt": req["prompt"],
+                "target_new": req["target_new"],
+                "saved_model_dir": case_dir,
+                "easyedit_metrics": metrics[0] if isinstance(metrics, list) and metrics else metrics,
+            }
+            return rec
 
         use_ds_tensor_parallel = bool(ds_enabled and (ds_mp_size or 0) > 1 and dist_world_size > 1)
         if use_ds_tensor_parallel:
@@ -1495,7 +1527,7 @@ def run_one_case(
         rec.setdefault("locality_hit", None)
 
         # ===== 生成结束后按需删除保存目录 =====
-        if save_edited_to and delete_saved_after and case_dir:
+        if delete_saved_after and case_dir:
             dist_inited = False
             try:
                 import torch.distributed as dist  # type: ignore
@@ -1579,6 +1611,8 @@ def main():
     # 保存/清理
     ap.add_argument("--save_edited_to", default="", help="保存编辑后模型到该目录（每个case建子目录）")
     ap.add_argument("--delete_saved_after", action="store_true", help="生成后删除该case保存目录")
+    ap.add_argument("--stage", choices=["full", "edit", "infer"], default="full", help="Run full pipeline, edit-only, or infer-only stage.")
+    ap.add_argument("--load_edited_from", default="", help="When stage=infer, load edited model from this directory")
     # Connectivity
     ap.add_argument("--offline", action="store_true", help="Offline mode: do not contact Hugging Face Hub; require local files")
 
@@ -1591,6 +1625,9 @@ def main():
 
     if not args.no_judge and not args.judge_model:
         raise SystemExit("需要提供 --judge_model，或使用 --no_judge 跳过裁判。")
+
+    if args.stage == "infer" and not args.load_edited_from:
+        raise SystemExit("stage=infer 需要提供 --load_edited_from。")
 
     # 速度小优化：如支持则启用 TF32（对大多数 A100/RTX40 有收益）
     try:
@@ -1705,6 +1742,8 @@ def main():
                 save_edited_to=args.save_edited_to,
                 delete_saved_after=args.delete_saved_after,
                 save_tag=str(idx),
+                stage=args.stage,
+                load_edited_from=args.load_edited_from,
             )
             rec["case_index"] = idx
         except Exception as e:

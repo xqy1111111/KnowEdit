@@ -36,7 +36,6 @@ TEMPERATURE=${TEMPERATURE:-0}
 TOP_P=${TOP_P:-1}
 SKIP_SECS=${SKIP_SECS:-1}
 
-export CUDA_VISIBLE_DEVICES="$GPUS"
 export TOKENIZERS_PARALLELISM=false
 
 # Ensure Hugging Face caches default to a writable repo-local location if not set
@@ -49,12 +48,30 @@ mkdir -p "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" || 
 
 for ((i=0; i<COUNT; i++)); do
   IDX=$((START_IDX + i))
+  ALG_LOWER=$(echo "$ALG" | tr '[:upper:]' '[:lower:]')
+  CASE_DIR="$SAVE_POOL/${ALG_LOWER}-${IDX}"
+
+  EDIT_GPU="${GPUS%%,*}"
+  echo "[EDIT] case_index=$IDX using GPU $EDIT_GPU"
+  CUDA_VISIBLE_DEVICES="$EDIT_GPU" \
+  python -m scripts.edit_once_with_judge \
+    --alg "$ALG" \
+    --hparams "$HPARAMS" \
+    --data_path "$DATA" \
+    --case_index "$IDX" --repeat 1 \
+    --no_judge \
+    --save_edited_to "$SAVE_POOL" \
+    --gen_mode "$GEN_MODE" --max_new_tokens "$MAX_NEW_TOKENS" --temperature "$TEMPERATURE" --top_p "$TOP_P" \
+    ${OFFLINE:+--offline} \
+    --print_every 1 \
+    --stage edit
+
   export MASTER_ADDR=127.0.0.1
   BASE_PORT=${BASE_PORT:-29501}
   export MASTER_PORT=$((BASE_PORT + (IDX % 256)))
 
-  echo "[RUN] case_index=$IDX  MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
-  # Explicitly pass rendezvous endpoint to avoid defaulting to 29500.
+  echo "[INFER] case_index=$IDX  MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
+  CUDA_VISIBLE_DEVICES="$GPUS" \
   torchrun --nproc_per_node="${DS_MP_SIZE}" \
     --rdzv_backend=c10d --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
     --module scripts.edit_once_with_judge \
@@ -64,12 +81,13 @@ for ((i=0; i<COUNT; i++)); do
     --case_index "$IDX" --repeat 1 \
     --no_judge \
     --use_ds_infer --ds_mp_size "$DS_MP_SIZE" --ds_dtype "$DS_DTYPE" \
-    --save_edited_to "$SAVE_POOL" \
-    --delete_saved_after \
     --gen_mode "$GEN_MODE" --max_new_tokens "$MAX_NEW_TOKENS" --temperature "$TEMPERATURE" --top_p "$TOP_P" \
     --save_jsonl "$OUT_JSONL" \
     ${OFFLINE:+--offline} \
-    --print_every 1
+    --print_every 1 \
+    --stage infer \
+    --load_edited_from "$CASE_DIR" \
+    --delete_saved_after
 
   sleep "$SKIP_SECS"
 done
