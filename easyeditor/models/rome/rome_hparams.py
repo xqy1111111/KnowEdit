@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List, Optional
 import yaml
 
 from ...util.hparams import HyperParams
@@ -39,6 +39,7 @@ class ROMEHyperParams(HyperParams):
     max_length: int = 40
     model_parallel: bool = False
     fp16: bool = False
+    max_memory: Optional[Dict[str, str]] = None
 
     @classmethod
     def from_hparams(cls, hparams_name_or_path: str):

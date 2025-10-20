@@ -82,6 +82,8 @@ class BaseEditor:
                     "torch_dtype": torch_dtype,
                     "device_map": device_map
                 }
+                if getattr(hparams, "max_memory", None):
+                    model_kwargs["max_memory"] = hparams.max_memory
 
             if 't5' in self.model_name.lower():
                 self.model = T5ForConditionalGeneration.from_pretrained(self.model_name, **model_kwargs)
@@ -637,5 +639,4 @@ class BaseEditor:
     ):
         metrics = self.apply_algo(datasets, self.hparams)
         return metrics
-
 

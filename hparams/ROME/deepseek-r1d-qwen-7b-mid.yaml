@@ -1,5 +1,5 @@
 alg_name: "ROME"
-model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+model_name: "/root/KnowEdit/hugging_cache/deepseek-r1d-qwen-7b"
 stats_dir: "./data/stats"
 device: 0
 
@@ -16,7 +16,7 @@ clamp_norm_factor: 4
 kl_factor: 0.0625
 
 # 二阶矩（开启更稳，使用缓存统计）
-mom2_adjustment: true
+mom2_adjustment: false
 context_template_length_params: [[5, 10], [10, 10]]
 
 # Qwen/R1 模块命名
@@ -32,6 +32,15 @@ mom2_dataset: "wikipedia"
 mom2_n_samples: 100000
 mom2_dtype: "float32"
 
-model_parallel: false
-fp16: false
-
+model_parallel: true
+fp16: true
+max_length: 512
+max_memory:
+  'cuda:0': "20GiB"
+  'cuda:1': "20GiB"
+  'cuda:2': "20GiB"
+  'cuda:3': "20GiB"
+  'cuda:4': "20GiB"
+  'cuda:5': "20GiB"
+  'cuda:6': "20GiB"
+  'cuda:7': "20GiB"
