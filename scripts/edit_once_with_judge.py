@@ -96,7 +96,9 @@ from easyeditor import (
     FTHyperParams,
     LoRAHyperParams,
     QLoRAHyperParams,
+    MEMITHyperParams,
 )
+from easyeditor.models.memit import apply_memit_to_model  # type: ignore
 
 # Improve CUDA memory fragmentation resilience unless user overrides.
 # Effective as long as set before first CUDA allocation.
@@ -746,6 +748,67 @@ def heuristic_extract_subject(prompt: str) -> str:
     print("[WARN] 无法从 prompt 中提取主语")
     return ""
 
+# ===================== 读取 MEMIT Anchors =====================
+def _read_memit_anchors_group(path: str, case_id: str, take: int = 6) -> Dict[str, Any]:
+    """Read anchors JSONL produced by scripts/cot_to_memit_anchors.py and pack one case.
+
+    Returns a ZSRE-like single request dict with extra key 'memit_bundle' listing
+    multiple anchor requests for a single unified MEMIT update.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"anchors_jsonl not found: {path}")
+    rows: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for ln in fh:
+            s = ln.strip()
+            if not s:
+                continue
+            try:
+                rows.append(json.loads(s))
+            except Exception:
+                continue
+    group = [r for r in rows if str(r.get("case_id", "")) == str(case_id)]
+    if not group:
+        raise RuntimeError(f"No anchors for case_id={case_id} in {path}")
+    # Basic fields
+    subject = (group[0].get("subject") or "").strip()
+    target_new = (group[0].get("target_new") or "").strip()
+    if not subject or not target_new:
+        raise RuntimeError("anchors missing subject or target_new")
+
+    # Render prompts with real subject for MEMIT (it will convert to '{}' internally)
+    memit_reqs: List[Dict[str, Any]] = []
+    eval_prompt = None
+    for r in group[:max(1, int(take))]:
+        p = (r.get("prompt") or "").strip()
+        if not p:
+            continue
+        pr = p.format(subject) if "{}" in p else p
+        if eval_prompt is None:
+            eval_prompt = pr
+        memit_reqs.append({
+            "prompt": pr,
+            "subject": subject,
+            "target_new": target_new,
+            "case_id": str(case_id),
+        })
+    if not memit_reqs:
+        raise RuntimeError("No valid prompts in anchors group after formatting")
+    if not eval_prompt:
+        eval_prompt = memit_reqs[0]["prompt"]
+
+    # Pack into single-case request for this runner
+    req = {
+        "prompt": eval_prompt,
+        "target_new": target_new,
+        "subject": subject,
+        "locality": {},
+        "portability": {},
+        # extra payload consumed by run_one_case when alg==MEMIT
+        "memit_bundle": memit_reqs,
+    }
+    return req
+
 # ===================== 构建 Editor =====================
 ALG_HP_MAP = {
     "ROME": (ROMEHyperParams, "ROME"),
@@ -753,6 +816,7 @@ ALG_HP_MAP = {
     "FT": (FTHyperParams, "FT"),
     "LORA": (LoRAHyperParams, "LoRA"),
     "QLORA": (QLoRAHyperParams, "QLoRA"),
+    "MEMIT": (MEMITHyperParams, "MEMIT"),
 }
 
 SUPPORTED_ALG_NAMES = [display for _, display in ALG_HP_MAP.values()]
@@ -1035,14 +1099,14 @@ def run_one_case(
                 judge_tok, judge_model = jt, jm
                 judge_loaded = True
 
-        if alg.upper() == "ROME":
+        if alg.upper() in {"ROME", "MEMIT"}:
             s = req.get("subject", "")
             if not s:
                 s = heuristic_extract_subject(req["prompt"])
                 if s:
-                    warnings.warn(f"[ROME] subject missing; heuristically extracted '{s}'")
+                    warnings.warn(f"[{alg.upper()}] subject missing; heuristically extracted '{s}'")
                 else:
-                    raise ValueError(f"[ROME] cannot find subject for prompt: {req['prompt']}")
+                    raise ValueError(f"[{alg.upper()}] cannot find subject for prompt: {req['prompt']}")
             if s not in req["prompt"]:
                 req = dict(req)
                 req["prompt"] = f"{req['prompt']} (Subject: {s})"
@@ -1206,7 +1270,20 @@ def run_one_case(
         metrics: Any = []
         edited_model = None
         if do_edit and main_rank and editor is not None:
-            metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
+            if alg.upper() == "MEMIT" and isinstance(req, dict) and req.get("memit_bundle"):
+                # Use the packed multi-anchor requests for a single unified MEMIT update
+                try:
+                    edited_model, _ = apply_memit_to_model(
+                        editor.model,
+                        tok_for_edit if tok_for_edit is not None else _unwrap_tokenizer(editor.tok),
+                        req["memit_bundle"],
+                        base_hp,  # MEMITHyperParams
+                        return_orig_weights=True,
+                    )
+                except Exception as memit_exc:
+                    raise RuntimeError(f"MEMIT apply failed: {memit_exc}")
+            else:
+                metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
 
         # 编辑后：恢复以便生成阶段加速
         try:
@@ -1491,6 +1568,12 @@ def run_one_case(
             "rewrite_hit": rec_rewrite_hit,
             "easyedit_metrics": metrics[0] if isinstance(metrics, list) and metrics else metrics,
         }
+        if isinstance(req, dict) and req.get("memit_bundle"):
+            try:
+                rec["memit_anchor_count"] = len(req["memit_bundle"])  # type: ignore[index]
+                rec["case_id"] = req["memit_bundle"][0].get("case_id", "")  # type: ignore[index]
+            except Exception:
+                pass
         if gen_mode in {"reason", "r1d"}:
             fa, rs = extract_final(pred_after)
             if fa:
@@ -1571,7 +1654,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--alg", required=True, choices=SUPPORTED_ALG_NAMES, help="Editing algorithm")
     ap.add_argument("--hparams", required=True, help="Path to YAML under hparams/")
-    ap.add_argument("--data_path", required=True, help="ZSRE-like JSON path")
+    ap.add_argument("--data_path", required=False, default="", help="ZSRE-like JSON path (ignored if --anchors_jsonl is set)")
     ap.add_argument("--model", default="", help="HF model id/path to override YAML")
     ap.add_argument("--case_index", type=int, default=0, help="Start index in dataset")
     ap.add_argument("--repeat", type=int, default=1, help="How many consecutive cases to run")
@@ -1615,6 +1698,11 @@ def main():
     ap.add_argument("--load_edited_from", default="", help="When stage=infer, load edited model from this directory")
     # Connectivity
     ap.add_argument("--offline", action="store_true", help="Offline mode: do not contact Hugging Face Hub; require local files")
+
+    # MEMIT anchors (optional): if provided, override data_path and build a single case
+    ap.add_argument("--anchors_jsonl", default="", help="Path to MEMIT anchors JSONL (from scripts/cot_to_memit_anchors.py)")
+    ap.add_argument("--anchors_case_id", default="", help="Case id to pick from anchors JSONL")
+    ap.add_argument("--anchors_take", type=int, default=6, help="Max anchors to take for one MEMIT update")
 
     args = ap.parse_args()
 
@@ -1698,9 +1786,18 @@ def main():
     if args.use_ds_infer and (args.ds_mp_size or 0) > 1 and not is_dist:
         warnings.warn("要求 ds_mp_size>1 但未检测到分布式环境（需 torchrun 启动），将退回单进程模式。")
 
-    all_reqs = read_zsre_like(args.data_path)
-    if not all_reqs:
-        raise RuntimeError(f"No valid requests parsed from {args.data_path}")
+    # Build requests source
+    if args.anchors_jsonl:
+        if not args.anchors_case_id:
+            raise SystemExit("--anchors_jsonl 需要配合 --anchors_case_id")
+        one = _read_memit_anchors_group(args.anchors_jsonl, args.anchors_case_id, take=args.anchors_take)
+        all_reqs = [one]
+    else:
+        if not args.data_path:
+            raise SystemExit("需要提供 --data_path 或 (--anchors_jsonl + --anchors_case_id)")
+        all_reqs = read_zsre_like(args.data_path)
+        if not all_reqs:
+            raise RuntimeError(f"No valid requests parsed from {args.data_path}")
     N = len(all_reqs)
 
     fw = None
