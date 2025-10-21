@@ -99,10 +99,23 @@ def layer_stats(
         # from datasets import Dataset
         # raw_ds = Dataset.from_file('XXX/XXX/wikipedia-train.arrow')
         # raw_ds = {'train': raw_ds}
-        raw_ds = load_dataset(
-            ds_name,
-            dict(wikitext="wikitext-103-raw-v1", wikipedia="20200501.en")[ds_name]
-        )
+        # Support environment overrides for Wikipedia under datasets>=3.
+        default_cfg = dict(wikitext="wikitext-103-raw-v1", wikipedia="20231101.en")
+        repo = ds_name
+        config = default_cfg[ds_name]
+        if ds_name == "wikipedia":
+            repo = os.getenv("WIKI_DATASET", repo)
+            config = os.getenv("WIKI_CONFIG", config)
+        try:
+            raw_ds = load_dataset(repo, config)
+        except Exception as e:
+            # Fallback: if legacy 'wikipedia' fails (e.g., datasets>=3), try 'wikimedia/wikipedia'
+            if ds_name == "wikipedia" and repo == "wikipedia":
+                fallback_repo = "wikimedia/wikipedia"
+                fallback_cfg = os.getenv("WIKI_CONFIG", "20231101.en")
+                raw_ds = load_dataset(fallback_repo, fallback_cfg)
+            else:
+                raise
         if hasattr(model.config, 'n_positions'):
             maxlen = model.config.n_positions
         elif hasattr(model.config, 'max_sequence_length'):
