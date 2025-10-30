@@ -7,22 +7,22 @@ model_name: "./hugging_cache/deepseek-r1d-qwen-7b"
 stats_dir: "./data/stats"
 device: 0  # overridden by LOCAL_RANK under torchrun when not model_parallel
 
-# Editing layers (shallow-to-mid MLP down_proj) — robust defaults for 7B class
-layers: [4, 5, 6, 7, 8]
+# Editing layers (single mid layer is safer on R1D)
+layers: [14]
 layer_selection: "all"
 fact_token: "subject_last"
 
 # v* optimization (MEMIT internal vector solve)
-v_num_grad_steps: 25
-v_lr: 5e-1
-v_loss_layer: 27   # Qwen-7B family typically ~28 blocks; use a late layer
-v_weight_decay: 1e-3
+v_num_grad_steps: 80
+v_lr: 5e-2
+v_loss_layer: 31   # Qwen-7B has ~32 blocks; tie loss late
+v_weight_decay: 1e-2
 
 # Regularization / stability
-clamp_norm_factor: 4
+clamp_norm_factor: 0.75
 kl_factor: 0.0625
 mom2_adjustment: true
-mom2_update_weight: 15000
+mom2_update_weight: 100000
 
 # Module templates (Qwen/LLaMA-style naming)
 rewrite_module_tmp: "model.layers.{}.mlp.down_proj"
@@ -34,9 +34,8 @@ lm_head_module:     "lm_head"
 
 # Second-moment stats for covariance (precomputed/streamed)
 mom2_dataset: "wikipedia"
-mom2_n_samples: 100000
+mom2_n_samples: 50000
 mom2_dtype: "float32"
 
 # Runtime
 model_parallel: false
-

@@ -5,15 +5,16 @@ tokenizer_class: AutoTokenizer
 tokenizer_name: "/home/xmwang/tmp1/hugging_cache/deepseek-r1d-qwen-7b"
 model_parallel: false
 inner_params:
-  - model.layers.29.mlp.gate_proj.weight
-  - model.layers.29.mlp.up_proj.weight
-  - model.layers.29.mlp.down_proj.weight
-  - model.layers.30.mlp.gate_proj.weight
-  - model.layers.30.mlp.up_proj.weight
-  - model.layers.30.mlp.down_proj.weight
-  - model.layers.31.mlp.gate_proj.weight
-  - model.layers.31.mlp.up_proj.weight
-  - model.layers.31.mlp.down_proj.weight
+  # DeepSeek-R1D-Qwen-7B 使用 Qwen2 架构，层数通常为 28（0..27），因此末三层为 25/26/27。
+  - model.layers.25.mlp.gate_proj.weight
+  - model.layers.25.mlp.up_proj.weight
+  - model.layers.25.mlp.down_proj.weight
+  - model.layers.26.mlp.gate_proj.weight
+  - model.layers.26.mlp.up_proj.weight
+  - model.layers.26.mlp.down_proj.weight
+  - model.layers.27.mlp.gate_proj.weight
+  - model.layers.27.mlp.up_proj.weight
+  - model.layers.27.mlp.down_proj.weight
 
 archive: null
 
@@ -69,4 +70,3 @@ grad_clip: 100.
 
 # Output
 results_dir: ./results
-
