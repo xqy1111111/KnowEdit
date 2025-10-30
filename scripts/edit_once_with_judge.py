@@ -97,6 +97,9 @@ from easyeditor import (
     LoRAHyperParams,
     QLoRAHyperParams,
     MEMITHyperParams,
+    MENDHyperParams,
+    AlphaEditHyperParams,
+    IKEHyperParams,
 )
 from easyeditor.models.memit import apply_memit_to_model  # type: ignore
 
@@ -200,6 +203,29 @@ def pick_dtype() -> torch.dtype:
             pass
         return torch.float16
     return torch.float32
+
+def _resolve_infer_dtype(ds_dtype: str) -> torch.dtype:
+    """Choose a safe CUDA dtype for inference. If bf16 is requested/auto-picked but
+    triangular ops are unsupported on this stack, fallback to fp16 to avoid
+    "triu_tril_cuda_template not implemented for 'BFloat16'" errors.
+    """
+    # Explicit overrides
+    if ds_dtype == "fp16":
+        return torch.float16
+    if ds_dtype == "bf16":
+        candidate = torch.bfloat16
+    else:  # auto
+        candidate = torch.bfloat16 if torch.cuda.is_available() and getattr(torch.cuda, "is_bf16_supported", lambda: False)() else torch.float16
+    if candidate is torch.bfloat16:
+        # Runtime op check: some stacks claim bf16 support but miss tri[u|l] kernels
+        try:
+            x = torch.zeros((2, 2), device=("cuda" if torch.cuda.is_available() else "cpu"), dtype=torch.bfloat16)
+            _ = torch.triu(x)
+            _ = torch.tril(x)
+            return torch.bfloat16
+        except Exception:
+            return torch.float16
+    return candidate
 
 def ensure_pad_token(tokenizer: AutoTokenizer) -> bool:
     """Ensure tokenizer has a valid pad id; return True if new tokens were added."""
@@ -550,14 +576,8 @@ def _maybe_apply_ds_inference(model, use_ds_infer: bool,
         warnings.warn("未安装 deepspeed 或导入失败，跳过 DeepSpeed Inference。")
         return model
 
-    # 解析 dtype
-    if ds_dtype == "bf16":
-        target_dtype = torch.bfloat16
-    elif ds_dtype == "fp16":
-        target_dtype = torch.float16
-    else:
-        # auto：尽量用 bf16，其次 fp16
-        target_dtype = pick_dtype()
+    # 解析 dtype（带运行时降级，避免 bf16 缺三角核）
+    target_dtype = _resolve_infer_dtype(ds_dtype)
 
     # ensure eval & cache for speed
     try:
@@ -817,6 +837,9 @@ ALG_HP_MAP = {
     "LORA": (LoRAHyperParams, "LoRA"),
     "QLORA": (QLoRAHyperParams, "QLoRA"),
     "MEMIT": (MEMITHyperParams, "MEMIT"),
+    "MEND": (MENDHyperParams, "MEND"),
+    "ALPHAEDIT": (AlphaEditHyperParams, "AlphaEdit"),
+    "IKE": (IKEHyperParams, "IKE"),
 }
 
 SUPPORTED_ALG_NAMES = [display for _, display in ALG_HP_MAP.values()]
@@ -856,11 +879,10 @@ def _build_messages(prompt: str, mode: str) -> list:
     elif mode == "concise":
         sys_msg = "Answer with a short noun phrase only. Do NOT explain."
     elif mode == "r1d":
-        # DeepSeek-R1-Distill 友好：仅使用 user 消息，并在内容内以 <think> 起手
-        # 官方建议避免使用 system，将指令写入 user。
+        # DeepSeek-R1-Distill：只提供 user 消息，严格依赖 tokenizer.chat_template
+        # 不额外注入任何 prompt/指令，由模板在 add_generation_prompt=True 时自动前置 <think>。
         return [
-            {"role": "user", "content": f"{prompt}" + "\nThink step by step INSIDE <think>...</think>. Then output ONLY the final short answer INSIDE <answer>...</answer>. Do not include anything else outside these tags."},
-            {"role": "assistant", "content": "<think>"},  
+            {"role": "user", "content": prompt}
         ]
     else:  # "noprompt": 仅用户消息，不注入系统提示
         return [
@@ -880,7 +902,9 @@ def generate_answer(model, tokenizer, prompt: str,
     else:
         messages = _build_messages(prompt, mode=mode)
         if hasattr(tokenizer, "apply_chat_template"):
-            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            # 对 DeepSeek-R1-Distill，必须开启 add_generation_prompt 以触发模板自动插入 <think>
+            add_gen = True if mode == "r1d" else False
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_gen)
         else:
             if mode == "reason":
                 text = (
@@ -888,6 +912,9 @@ def generate_answer(model, tokenizer, prompt: str,
                     "Then output ONLY the final short answer INSIDE <answer>...</answer>.\n"
                     f"Q: {prompt}\nA:"
                 )
+            elif mode == "r1d":
+                # 无 chat_template 的兜底：尽量模拟模板行为，以 <think> 起手
+                text = f"{prompt}\n<think>"
             else:  # concise
                 text = f"Answer with a short noun phrase only. Do NOT explain.\nQ: {prompt}\nA:"
 
@@ -943,6 +970,7 @@ def generate_answer(model, tokenizer, prompt: str,
 _FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 _REASON_RE = re.compile(r"<reasoning>\s*(.*?)\s*</reasoning>", re.IGNORECASE | re.DOTALL)
 _THINK_RE = re.compile(r"<think>\s*(.*?)\s*</think>", re.IGNORECASE | re.DOTALL)
+_THINK_CLOSE_RE = re.compile(r"</think>", re.IGNORECASE)
 def extract_final(text: str) -> Tuple[str, str]:
     """通用解析：优先支持 <final>/<reasoning>；若无，则回退为 <think>…</think> + 其后的答案段。
     返回 (final_text, reasoning_or_think_text)。
@@ -956,7 +984,14 @@ def extract_final(text: str) -> Tuple[str, str]:
         final = (m_f.group(1).strip() if m_f else "").strip("：:").strip()
         reason = (m_r.group(1).strip() if m_r else "").strip()
         return final, reason
-    # 2) 回退到 <think> 语法：提取最后一个 </think> 后的文本作为 final；中间为思维段
+    # 2) R1D 新模板常把 <think> 放在提示词里，生成只包含 </think>
+    #    若仅出现闭合标签，则把其前内容当作思维段，其后为最终答案
+    m_close = _THINK_CLOSE_RE.search(text)
+    if m_close and not _THINK_RE.search(text):
+        reason_txt = text[: m_close.start()].strip()
+        tail_txt = text[m_close.end():].strip()
+        return tail_txt, reason_txt
+    # 3) 标准 <think>…</think>：取最后一段作为思维，尾部为最终答案
     last = None
     for m in _THINK_RE.finditer(text):
         last = m
@@ -1057,6 +1092,7 @@ def run_one_case(
     save_tag: str = "",
     stage: str = "full",
     load_edited_from: str = "",
+    train_ds: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
 
     gen_mode = generation_cfg.mode
@@ -1277,13 +1313,17 @@ def run_one_case(
                         editor.model,
                         tok_for_edit if tok_for_edit is not None else _unwrap_tokenizer(editor.tok),
                         req["memit_bundle"],
-                        base_hp,  # MEMITHyperParams
+                            base_hp,  # MEMITHyperParams
                         return_orig_weights=True,
                     )
                 except Exception as memit_exc:
                     raise RuntimeError(f"MEMIT apply failed: {memit_exc}")
             else:
-                metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True)
+                # For IKE, pass train_ds via kwargs
+                kwargs = {}
+                if alg.upper() == "IKE" and train_ds is not None:
+                    kwargs['train_ds'] = train_ds
+                metrics, edited_model, _ = editor.edit_requests(requests=[req], sequential_edit=True, **kwargs)
 
         # 编辑后：恢复以便生成阶段加速
         try:
@@ -1403,9 +1443,11 @@ def run_one_case(
             except Exception:
                 pass  # 失败则后续按 base_model_id 重新取
             try:
+                # Use safe dtype chosen for DS/accelerate inference
+                infer_dtype = _resolve_infer_dtype(ds_dtype)
                 edited_model = AutoModelForCausalLM.from_pretrained(
                     case_dir,
-                    torch_dtype=pick_dtype(),
+                    torch_dtype=infer_dtype,
                     trust_remote_code=True,
                 )
             except Exception as exc:
@@ -1424,9 +1466,10 @@ def run_one_case(
                 ensure_pad_token(tok_for_edit)
             except Exception:
                 tok_for_edit = None
+            infer_dtype = _resolve_infer_dtype(ds_dtype)
             edited_model = AutoModelForCausalLM.from_pretrained(
                 case_dir,
-                torch_dtype=pick_dtype(),
+                torch_dtype=infer_dtype,
                 trust_remote_code=True,
             )
 
@@ -1450,30 +1493,61 @@ def run_one_case(
                 use_ds_tensor_parallel = False
 
         if use_ds_tensor_parallel:
-            target_dtype = torch.bfloat16 if ds_dtype == "bf16" else (torch.float16 if ds_dtype == "fp16" else pick_dtype())
+            target_dtype = _resolve_infer_dtype(ds_dtype)
             try:
                 import deepspeed  # type: ignore
 
-                engine = deepspeed.init_inference(
-                    edited_model,
-                    mp_size=dist_world_size,
-                    dtype=target_dtype,
-                    replace_method="auto",
-                    replace_with_kernel_inject=bool(ds_kernel_inject),
-                )
-                edited_model = engine.module
+                # Prefer new API: tensor_parallel over deprecated mp_size/replace_method
+                # Avoid double tensor-parallel: disable Transformers AutoTP when using DS TP
+                os.environ.setdefault("TRANSFORMERS_AUTO_TP_DISABLE", "1")
+
+                # Provide an injection policy for Llama to improve DS kernel injection stability
+                inj_policy = None
+                if bool(ds_kernel_inject):
+                    try:
+                        from transformers.models.llama.modeling_llama import LlamaDecoderLayer  # type: ignore
+                        inj_policy = {LlamaDecoderLayer: ["self_attn.o_proj", "mlp.down_proj"]}
+                    except Exception:
+                        inj_policy = None
+                try:
+                    engine = deepspeed.init_inference(
+                        edited_model,
+                        dtype=target_dtype,
+                        tensor_parallel={"tp_size": dist_world_size},
+                        replace_with_kernel_inject=bool(ds_kernel_inject),
+                        injection_policy=inj_policy,
+                    )
+                except TypeError:
+                    # Fallback for older DS: use mp_size without kernel inject deprecations
+                    engine = deepspeed.init_inference(
+                        edited_model,
+                        mp_size=dist_world_size,
+                        dtype=target_dtype,
+                        replace_with_kernel_inject=bool(ds_kernel_inject),
+                    )
+                edited_model = getattr(engine, "module", engine)
             except Exception as exc:
-                warnings.warn(f"DeepSpeed 张量并行初始化失败，退回 accelerate/单卡：{exc}")
-                use_ds_tensor_parallel = False
-                if is_multi_rank:
-                    raise RuntimeError(f"DeepSpeed inference failed under distributed setup: {exc}") from exc
+                # Second-chance: retry without kernel injection
+                try:
+                    engine = deepspeed.init_inference(
+                        edited_model,
+                        dtype=target_dtype,
+                        tensor_parallel={"tp_size": dist_world_size},
+                        replace_with_kernel_inject=False,
+                    )
+                    edited_model = getattr(engine, "module", engine)
+                except Exception:
+                    warnings.warn(f"DeepSpeed 张量并行初始化失败，退回 accelerate/单卡：{exc}")
+                    use_ds_tensor_parallel = False
+                    if is_multi_rank:
+                        raise RuntimeError(f"DeepSpeed inference failed under distributed setup: {exc}") from exc
 
         if not use_ds_tensor_parallel:
             edited_model = _maybe_dispatch_generation_model(edited_model, gen_device_map, gen_max_memory)
             edited_model = _maybe_apply_ds_inference(
                 edited_model,
                 use_ds_infer=ds_enabled,
-                ds_dtype=ds_dtype,
+                ds_dtype=("fp16" if _resolve_infer_dtype(ds_dtype) is torch.float16 else "bf16"),
                 ds_max_out_tokens=ds_max_out_tokens,
                 ds_kernel_inject=ds_kernel_inject,
             )
@@ -1655,6 +1729,7 @@ def main():
     ap.add_argument("--alg", required=True, choices=SUPPORTED_ALG_NAMES, help="Editing algorithm")
     ap.add_argument("--hparams", required=True, help="Path to YAML under hparams/")
     ap.add_argument("--data_path", required=False, default="", help="ZSRE-like JSON path (ignored if --anchors_jsonl is set)")
+    ap.add_argument("--train_data_path", required=False, default="", help="Path to training examples for IKE (example pool for in-context retrieval)")
     ap.add_argument("--model", default="", help="HF model id/path to override YAML")
     ap.add_argument("--case_index", type=int, default=0, help="Start index in dataset")
     ap.add_argument("--repeat", type=int, default=1, help="How many consecutive cases to run")
@@ -1800,6 +1875,55 @@ def main():
             raise RuntimeError(f"No valid requests parsed from {args.data_path}")
     N = len(all_reqs)
 
+    # Load training examples for IKE (in-context retrieval pool)
+    train_ds = None
+    if args.train_data_path and args.alg.upper() == "IKE":
+        try:
+            with open(args.train_data_path, "r", encoding="utf-8") as f:
+                train_ds_raw = json.load(f)
+
+            # Convert field names to match IKE expectations: src/alt -> prompt/target_new
+            train_ds = []
+            for item in train_ds_raw:
+                converted = {
+                    "prompt": item.get("prompt") or item.get("src", ""),
+                    "target_new": item.get("target_new") or item.get("alt", ""),
+                }
+                # Optionally preserve other fields that IKE might use
+                if "rephrase" in item:
+                    converted["rephrase_prompt"] = item["rephrase"]
+                if "loc" in item:
+                    converted["locality_prompt"] = item.get("loc", "")
+                    converted["locality_ground_truth"] = item.get("loc_ans", "")
+                train_ds.append(converted)
+
+            print(f"[IKE] Loaded {len(train_ds)} training examples from {args.train_data_path}")
+
+            # Generate embedding cache for IKE
+            from easyeditor.models.ike import encode_ike_facts
+            from sentence_transformers import SentenceTransformer
+
+            # Load hyperparameters to get sentence_model_name and results_dir
+            hp_cls, _ = ALG_HP_MAP["IKE"]
+            ike_hp = hp_cls.from_hparams(args.hparams)
+            if args.model:
+                ike_hp.model_name = args.model
+
+            # Check if embedding cache already exists
+            safe_model_name = ike_hp.sentence_model_name.rsplit('/', 1)[-1]
+            cache_path = f'{ike_hp.results_dir}/{ike_hp.alg_name}/embedding/{safe_model_name}_{type(train_ds).__name__}_{len(train_ds)}.pkl'
+
+            if not os.path.exists(cache_path):
+                print(f"[IKE] Generating embedding cache at {cache_path}...")
+                sentence_model = SentenceTransformer(ike_hp.sentence_model_name).to(f'cuda:{ike_hp.device}')
+                encode_ike_facts(sentence_model, train_ds, ike_hp)
+                print(f"[IKE] Embedding cache generated successfully")
+            else:
+                print(f"[IKE] Using existing embedding cache at {cache_path}")
+        except Exception as e:
+            warnings.warn(f"Failed to load train_data from {args.train_data_path}: {e}")
+            train_ds = None
+
     fw = None
     if args.save_jsonl:
         path = os.path.abspath(os.path.expanduser(args.save_jsonl))
@@ -1841,6 +1965,7 @@ def main():
                 save_tag=str(idx),
                 stage=args.stage,
                 load_edited_from=args.load_edited_from,
+                train_ds=train_ds,
             )
             rec["case_index"] = idx
         except Exception as e:
