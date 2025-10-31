@@ -1,38 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./scripts/run_repeat_memit_noncot.sh [START_IDX] [COUNT]
-# Runs MEMIT with single-prompt (non-CoT) editing per case using a JSON/JSONL dataset.
-#
+# Usage: ./scripts/run_repeat.sh [START_IDX] [COUNT]
 # Env overrides:
-#   GPUS (default: 0,1)
-#   HPARAMS (default: hparams/MEMIT/llama3.2-3b.yaml)
-#   DATA (default: output/FT/noncot_q1d.jsonl)
-#   OUT_JSONL (default: outputs/MEMIT/memit_noncot_eval_ds_infer.jsonl)
+#   GPUS (default: 0,1,2,3,4,5,6,7)
+#   ALG (default: FT)
+#   HPARAMS (default: hparams/FT/deepseek-r1d-qwen-7b-cot.yaml)
+#   DATA (default: data/cot.jsonl)
+#   OUT_JSONL (default: outputs/ft_eval_ds_infer.jsonl)
 #   SAVE_POOL (default: outputs/edited_model_pool)
-#   DS_MP_SIZE (default: 2)
+#   DS_MP_SIZE (default: 8)
 #   DS_DTYPE (default: auto)
 #   GEN_MODE (default: noprompt)
 #   MAX_NEW_TOKENS (default: 256)
 #   TEMPERATURE (default: 0)
 #   TOP_P (default: 1)
-#   SKIP_SECS (default: 1)
+#   SKIP_SECS (default: 1)with
 
 START_IDX=${1:-0}
 COUNT=${2:-15}
 
-GPUS=${GPUS:-"4,5,6,7"}
-HPARAMS=${HPARAMS:-"hparams/MEMIT/deepseek-r1d-qwen-7b.yaml"}
-
+GPUS=${GPUS:-"0,1,2,3,4,5,6,7"}
+ALG=${ALG:-"ROME"}
+HPARAMS=${HPARAMS:-"hparams/ROME/deepseek-r1d-qwen-7b-mid.offline.yaml"}
 DATA=${DATA:-"data/noncot.json"}
-OUT_JSONL=${OUT_JSONL:-"outputs/MEMIT/memit_noncot_eval_ds_infer.jsonl"}
+OUT_JSONL=${OUT_JSONL:-"outputs/ROME/cuda_8_rome_eval_ds_infer.jsonl"}
 SAVE_POOL=${SAVE_POOL:-"outputs/edited_model_pool"}
 
-DS_MP_SIZE=${DS_MP_SIZE:-2}
+DS_MP_SIZE=${DS_MP_SIZE:-8}
 DS_DTYPE=${DS_DTYPE:-auto}
 
 GEN_MODE=${GEN_MODE:-noprompt}
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-512}
 TEMPERATURE=${TEMPERATURE:-0}
 TOP_P=${TOP_P:-1}
 SKIP_SECS=${SKIP_SECS:-1}
@@ -42,25 +41,30 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
-# Default HF caches under repo (writable)
-HF_HOME_DEFAULT="$PWD/models/hf_cache"
+export MODEL_DIR="${MODEL_DIR:-$PWD/hugging_cache/deepseek-r1d-qwen-7b}"
+
+# 这三行你之前已有，保持指向工程内缓存即可
+export HF_HOME="${HF_HOME:-$PWD/models/hf_cache}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
+
+# Ensure Hugging Face caches default to a writable repo-local location if not set
+HF_HOME_DEFAULT="$PWD/models/hf_cache"with
 export HF_HOME="${HF_HOME:-$HF_HOME_DEFAULT}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
 mkdir -p "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" || true
 
-mkdir -p "$SAVE_POOL" || true
+EDIT_GPUS=${EDIT_GPUS:-$GPUS}
 
 for ((i=0; i<COUNT; i++)); do
   IDX=$((START_IDX + i))
-  ALG="MEMIT"
-  ALG_LOWER="memit"
+  ALG_LOWER=$(echo "$ALG" | tr '[:upper:]' '[:lower:]')
   CASE_DIR="$SAVE_POOL/${ALG_LOWER}-${IDX}"
 
-  EDIT_GPU="${GPUS%%,*}"
-  echo "[EDIT][MEMIT-noncot] case_index=$IDX using GPU $EDIT_GPU"
-  CUDA_VISIBLE_DEVICES="$EDIT_GPU" \
+  echo "[EDIT] case_index=$IDX using GPUs $EDIT_GPUS"
+  CUDA_VISIBLE_DEVICES="$EDIT_GPUS" \
   python -m scripts.edit_once_with_judge \
     --alg "$ALG" \
     --hparams "$HPARAMS" \
@@ -77,7 +81,7 @@ for ((i=0; i<COUNT; i++)); do
   BASE_PORT=${BASE_PORT:-29501}
   export MASTER_PORT=$((BASE_PORT + (IDX % 256)))
 
-  echo "[INFER][MEMIT-noncot] case_index=$IDX  MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
+  echo "[INFER] case_index=$IDX  MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
   CUDA_VISIBLE_DEVICES="$GPUS" \
   torchrun --nproc_per_node="${DS_MP_SIZE}" \
     --rdzv_backend=c10d --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
@@ -98,4 +102,3 @@ for ((i=0; i<COUNT; i++)); do
 
   sleep "$SKIP_SECS"
 done
-

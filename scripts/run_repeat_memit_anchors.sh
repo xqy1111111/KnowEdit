@@ -22,13 +22,12 @@ set -euo pipefail
 START_IDX=${1:-0}
 COUNT=${2:-15}
 
-GPUS=${GPUS:-"0,1"}
-HPARAMS=${HPARAMS:-"hparams/MEMIT/llama3.2-3b.yaml"}
+GPUS=${GPUS:-"0,1,2,3"}
 ANCHORS=${ANCHORS:-"data/memit_anchors_reph.jsonl"}
 OUT_JSONL=${OUT_JSONL:-"outputs/MEMIT/memit_eval_ds_infer.jsonl"}
 SAVE_POOL=${SAVE_POOL:-"outputs/edited_model_pool"}
 
-DS_MP_SIZE=${DS_MP_SIZE:-2}
+DS_MP_SIZE=${DS_MP_SIZE:-4}
 DS_DTYPE=${DS_DTYPE:-auto}
 
 GEN_MODE=${GEN_MODE:-noprompt}
@@ -39,9 +38,9 @@ SKIP_SECS=${SKIP_SECS:-1}
 CASE_ID_OFFSET=${CASE_ID_OFFSET:-1}
 
 export TOKENIZERS_PARALLELISM=false
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-export HF_DATASETS_OFFLINE=1
+# export HF_HUB_OFFLINE=1
+# export TRANSFORMERS_OFFLINE=1
+# export HF_DATASETS_OFFLINE=1
 
 # Default HF caches under repo (writable)
 HF_HOME_DEFAULT="$PWD/models/hf_cache"

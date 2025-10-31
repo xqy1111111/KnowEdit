@@ -1,27 +1,30 @@
 alg_name: "MEMIT"
+
+# Prefer local cache to avoid network in offline setups; otherwise use:
+# model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 model_name: "./hugging_cache/deepseek-r1d-qwen-7b"
 
 stats_dir: "./data/stats"
-device: 0
+device: 0  # overridden by LOCAL_RANK under torchrun when not model_parallel
 
 # Editing layers (shallow-to-mid MLP down_proj) — robust defaults for 7B class
-layers: [4, 5, 6, 7, 8]
+layers: [12, 13, 14]
 layer_selection: "all"
 fact_token: "subject_last"
 
 # v* optimization (MEMIT internal vector solve)
-v_num_grad_steps: 25
-v_lr: 5e-1
+v_num_grad_steps: 60
+v_lr: 5e-3
 v_loss_layer: 27   # Qwen-7B family typically ~28 blocks; use a late layer
-v_weight_decay: 1e-3
+v_weight_decay: 1e-2
 
 # Regularization / stability
-clamp_norm_factor: 4
-kl_factor: 0.0625
+clamp_norm_factor: 1.0
+kl_factor: 0.625
 mom2_adjustment: true
-mom2_update_weight: 15000
+mom2_update_weight: 50000
 
-# 模块模板（Qwen/LLaMA 系）
+# Module templates (Qwen/LLaMA-style naming)
 rewrite_module_tmp: "model.layers.{}.mlp.down_proj"
 layer_module_tmp:   "model.layers.{}"
 mlp_module_tmp:     "model.layers.{}.mlp"
@@ -29,9 +32,10 @@ attn_module_tmp:    "model.layers.{}.self_attn"
 ln_f_module:        "model.norm"
 lm_head_module:     "lm_head"
 
-# 二阶矩统计：做大样本量；或使用与你模型匹配的预计算 stats
+# Second-moment stats for covariance (precomputed/streamed)
 mom2_dataset: "wikipedia"
-mom2_n_samples: 50000
+mom2_n_samples: 1
 mom2_dtype: "float32"
 
+# Runtime
 model_parallel: false

@@ -1,8 +1,8 @@
 # Model
-model_name: "/home/xmwang/tmp1/hugging_cache/deepseek-r1d-qwen-7b"
+model_name: "/root/KnowEdit/hugging_cache/deepseek-r1d-qwen-7b"
 model_class: AutoModelForCausalLM
 tokenizer_class: AutoTokenizer
-tokenizer_name: "/home/xmwang/tmp1/hugging_cache/deepseek-r1d-qwen-7b"
+tokenizer_name: "/root/KnowEdit/hugging_cache/deepseek-r1d-qwen-7b"
 model_parallel: false
 inner_params:
   # DeepSeek-R1D-Qwen-7B 使用 Qwen2 架构，层数通常为 28（0..27），因此末三层为 25/26/27。

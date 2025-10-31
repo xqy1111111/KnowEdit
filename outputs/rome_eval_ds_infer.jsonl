@@ -1,0 +1,8 @@
+{"case_index": 0, "error": "Error no file named pytorch_model.bin, model.safetensors, tf_model.h5, model.ckpt.index or flax_model.msgpack found in directory /root/KnowEdit/outputs/edited_model_pool/rome-0."}
+{"case_index": 1, "error": "Incorrect path_or_model_id: '/root/KnowEdit/outputs/edited_model_pool/rome-1'. Please provide either the path to a local folder or the repo_id of a model on the Hub."}
+{"case_index": 0, "error": "Error no file named pytorch_model.bin, model.safetensors, tf_model.h5, model.ckpt.index or flax_model.msgpack found in directory /root/KnowEdit/outputs/edited_model_pool/rome-0."}
+{"case_index": 0, "error": "Incorrect path_or_model_id: '/root/KnowEdit/outputs/edited_model_pool/rome-0'. Please provide either the path to a local folder or the repo_id of a model on the Hub."}
+{"case_index": 1, "error": "Incorrect path_or_model_id: '/root/KnowEdit/outputs/edited_model_pool/rome-1'. Please provide either the path to a local folder or the repo_id of a model on the Hub."}
+{"case_index": 0, "error": "Incorrect path_or_model_id: '/root/KnowEdit/outputs/edited_model_pool/rome-0'. Please provide either the path to a local folder or the repo_id of a model on the Hub."}
+{"case_index": 0, "error": "Incorrect path_or_model_id: '/root/KnowEdit/outputs/edited_model_pool/rome-0'. Please provide either the path to a local folder or the repo_id of a model on the Hub."}
+{"case_index": 0, "error": "Incorrect path_or_model_id: '/root/KnowEdit/outputs/edited_model_pool/rome-0'. Please provide either the path to a local folder or the repo_id of a model on the Hub."}

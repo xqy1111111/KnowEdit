@@ -21,20 +21,20 @@ set -euo pipefail
 START_IDX=${1:-0}
 COUNT=${2:-15}
 
-GPUS=${GPUS:-"0,1,2,3,4,5,6,7"}
-ALG=${ALG:-"FT"}
-HPARAMS=${HPARAMS:-"hparams/FT/deepseek-r1d-qwen-7b-cot.yaml"}
-DATA=${DATA:-"data/cot.jsonl"}
-OUT_JSONL=${OUT_JSONL:-"outputs/ft_eval_ds_infer.jsonl"}
+GPUS=${GPUS:-"0,1,2,3"}
+ALG=${ALG:-"ROME"}
+HPARAMS=${HPARAMS:-"hparams/ROME/deepseek-r1d-qwen-7b-mid.yaml"}
+DATA=${DATA:-"data/noncot.json"}
+OUT_JSONL=${OUT_JSONL:-"outputs/rome_accelerate_eval_ds_infer.jsonl"}
 SAVE_POOL=${SAVE_POOL:-"outputs/edited_model_pool"}
 
 BASE_PORT=${BASE_PORT:-29501}
-DS_MP_SIZE=${DS_MP_SIZE:-8}
+DS_MP_SIZE=${DS_MP_SIZE:-4}
 DS_DTYPE=${DS_DTYPE:-auto}
 
 GEN_MODE=${GEN_MODE:-noprompt}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
-TEMPERATURE=${TEMPERATURE:-0}
+TEMPERATURE=${TEMPERATURE:-0.1}
 TOP_P=${TOP_P:-1}
 SKIP_SECS=${SKIP_SECS:-1}
 

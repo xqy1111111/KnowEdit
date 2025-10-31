@@ -21,11 +21,11 @@ set -euo pipefail
 START_IDX=${1:-0}
 COUNT=${2:-15}
 
-GPUS=${GPUS:-"4,5,6,7"}
+GPUS=${GPUS:-"0,1,2,3"}
 HPARAMS=${HPARAMS:-"hparams/MEMIT/deepseek-r1d-qwen-7b.yaml"}
 
 DATA=${DATA:-"data/noncot.json"}
-OUT_JSONL=${OUT_JSONL:-"outputs/MEMIT/memit_noncot_eval_ds_infer.jsonl"}
+OUT_JSONL=${OUT_JSONL:-"outputs/MEMIT/memit_noncot_eval_ds_infere1030.jsonl"}
 SAVE_POOL=${SAVE_POOL:-"outputs/edited_model_pool"}
 
 DS_MP_SIZE=${DS_MP_SIZE:-2}

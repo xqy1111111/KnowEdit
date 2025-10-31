@@ -7,7 +7,6 @@ examples/wiki_recent
 .vscode
 logs
 results
-outputs
 vectors
 **/.cache/
 *.log
@@ -19,3 +18,5 @@ delta.txt
 **/*_test_reps*
 *test_reps
 *test_reps.*
+hf_cache
+*edited_model_pool

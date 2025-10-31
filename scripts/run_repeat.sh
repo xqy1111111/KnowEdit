@@ -20,23 +20,33 @@ set -euo pipefail
 START_IDX=${1:-0}
 COUNT=${2:-15}
 
-GPUS=${GPUS:-"0,1,2,3,4,5,6,7"}
-ALG=${ALG:-"FT"}
-HPARAMS=${HPARAMS:-"hparams/FT/deepseek-r1d-qwen-7b-cot.yaml"}
-DATA=${DATA:-"data/cot.jsonl"}
-OUT_JSONL=${OUT_JSONL:-"outputs/ft_eval_ds_infer.jsonl"}
+GPUS=${GPUS:-"4,5,6,7"}
+ALG=${ALG:-"ROME"}
+HPARAMS=${HPARAMS:-"hparams/ROME/deepseek-r1d-qwen-7b-mid.offline.yaml"}
+DATA=${DATA:-"data/noncot.json"}
+OUT_JSONL=${OUT_JSONL:-"outputs/ROME/rome_eval_ds_infer.jsonl"}
 SAVE_POOL=${SAVE_POOL:-"outputs/edited_model_pool"}
 
-DS_MP_SIZE=${DS_MP_SIZE:-8}
+DS_MP_SIZE=${DS_MP_SIZE:-4}
 DS_DTYPE=${DS_DTYPE:-auto}
 
 GEN_MODE=${GEN_MODE:-noprompt}
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-512}
 TEMPERATURE=${TEMPERATURE:-0}
 TOP_P=${TOP_P:-1}
 SKIP_SECS=${SKIP_SECS:-1}
 
 export TOKENIZERS_PARALLELISM=false
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
+export MODEL_DIR="${MODEL_DIR:-$PWD/hugging_cache/deepseek-r1d-qwen-7b}"
+
+# 这三行你之前已有，保持指向工程内缓存即可
+export HF_HOME="${HF_HOME:-$PWD/models/hf_cache}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
 
 # Ensure Hugging Face caches default to a writable repo-local location if not set
 HF_HOME_DEFAULT="$PWD/models/hf_cache"
@@ -50,7 +60,6 @@ for ((i=0; i<COUNT; i++)); do
   IDX=$((START_IDX + i))
   ALG_LOWER=$(echo "$ALG" | tr '[:upper:]' '[:lower:]')
   CASE_DIR="$SAVE_POOL/${ALG_LOWER}-${IDX}"
-
   EDIT_GPU="${GPUS%%,*}"
   echo "[EDIT] case_index=$IDX using GPU $EDIT_GPU"
   CUDA_VISIBLE_DEVICES="$EDIT_GPU" \
