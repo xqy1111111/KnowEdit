@@ -36,11 +36,7 @@ model_parallel: true
 fp16: true
 max_length: 512
 max_memory:
-  'cuda:0': "20GiB"
-  'cuda:1': "20GiB"
-  'cuda:2': "20GiB"
-  'cuda:3': "20GiB"
-  'cuda:4': "20GiB"
-  'cuda:5': "20GiB"
-  'cuda:6': "20GiB"
-  'cuda:7': "20GiB"
+  0: "20GiB"
+  1: "20GiB"
+  2: "20GiB"
+  3: "20GiB"

@@ -1,0 +1,9 @@
+alg_name: "IKE"
+model_name: "/home/xmwang/tmp1/hugging_cache/deepseek-r1d-qwen-7b"
+sentence_model_name: "sentence-transformers/all-MiniLM-L6-v2"
+device: 0
+results_dir: "./results"
+
+# IKE parameters
+k: 16  # Number of in-context examples
+model_parallel: false

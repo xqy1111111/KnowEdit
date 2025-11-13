@@ -128,13 +128,51 @@ class BaseTrainer:
         }
         LOG.info(f"Saving model to {self.save_path}")
 
+        bk_path = None
+        keep_backup = os.environ.get("EE_KEEP_BACKUP", "0") == "1"
         if os.path.exists(self.save_path):
             bk_path = f"{self.save_path}.bk"
-            LOG.info(f"Moving old archive to {bk_path}")
-            os.rename(self.save_path, bk_path)
+            # If a stale backup exists, try removing it first to limit space usage
+            if os.path.exists(bk_path):
+                try:
+                    os.remove(bk_path)
+                    LOG.info(f"Removed stale backup {bk_path}")
+                except Exception as exc:
+                    LOG.warning(f"Failed to remove stale backup {bk_path}: {exc}")
+            # Make a backup unless explicitly disabled
+            if keep_backup:
+                LOG.info(f"Keeping backup: moving old archive to {bk_path}")
+                os.rename(self.save_path, bk_path)
 
-        torch.save(obj, self.save_path)
-        LOG.info("Write complete.")
+        try:
+            torch.save(obj, self.save_path)
+            LOG.info("Write complete.")
+            # If we kept a backup for safety, optionally remove it after success to free space
+            if not keep_backup and bk_path and os.path.exists(bk_path):
+                try:
+                    os.remove(bk_path)
+                    LOG.info(f"Removed backup checkpoint: {bk_path}")
+                except Exception as exc:
+                    LOG.warning(f"Failed to remove backup {bk_path}: {exc}")
+        except Exception as e:
+            LOG.warning(f"Primary checkpoint save failed: {e}")
+            # Low-space fallback: remove backup (if any) and retry without backup
+            try:
+                if bk_path and os.path.exists(bk_path):
+                    os.remove(bk_path)
+                    LOG.info(f"Removed backup to free space: {bk_path}")
+            except Exception as exc:
+                LOG.warning(f"Failed to remove backup during fallback: {exc}")
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            try:
+                torch.save(obj, self.save_path)
+                LOG.info("Write complete (fallback without backup).")
+            except Exception as e2:
+                LOG.error(
+                    "Checkpoint save failed again. Please free disk space or set results_dir to a larger volume. Error: %s",
+                    e2,
+                )
+                raise
 
     def echo(self, train_step, info_dict, pretty=False):
         if not self.config.silent:

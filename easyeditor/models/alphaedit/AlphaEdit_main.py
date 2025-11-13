@@ -49,19 +49,27 @@ def apply_AlphaEdit_to_model(
         model = deepcopy(model)
     
     # Calculate the null-space projection matrix P
-    # Please ensure that you have downloaded "null_space_project.pt" to the easyedit folder beforehand, or get the P by following calculation
+    # Please ensure that you have prepared a P file (P_loc) or allow on-the-fly calculation once.
     if not os.path.exists(hparams.P_loc):
         print(os.path.abspath(hparams.P_loc))
         print(f"The null-space projection matrix P does not exist and now calculate.")
         W_out = nethook.get_parameter(model, f"{hparams.rewrite_module_tmp.format(hparams.layers[-1])}.weight")
-        if "llama" in hparams.model_name.lower() or "gpt-j-6b" in hparams.model_name.lower():
+        if "llama" in hparams.model_name.lower() or "qwen" in hparams.model_name.lower() or "gpt-j-6b" in hparams.model_name.lower():
             P = torch.zeros((len(hparams.layers), W_out.shape[1], W_out.shape[1]), device="cpu")
         elif "gpt2-xl" in hparams.model_name.lower():
             P = torch.zeros((len(hparams.layers), W_out.shape[0], W_out.shape[0]), device="cpu")
         del W_out
         for i, layer in enumerate(hparams.layers):
             P[i,:,:] = get_project(model, tok, layer, hparams)
-        torch.save(P, "null_space_project.pt")
+        # Save to configured location
+        try:
+            save_dir = os.path.dirname(hparams.P_loc)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+            torch.save(P, hparams.P_loc)
+        except Exception as _save_err:
+            # Fall back silently to CWD, but keep P in-memory
+            print(f"[WARN] Failed to save P to {hparams.P_loc}: {_save_err}. Keeping in-memory only.")
         P_loaded = True
     elif P_loaded == False:
         P = torch.load(hparams.P_loc)
@@ -116,8 +124,11 @@ def execute_AlphaEdit(
             # Space required for correct tokenization
             requests[i]["target_new"] = " " + request["target_new"]
         if '{}' not in request['prompt']:
-            assert request['subject'] in request['prompt'] or \
-                   print(f"Subject:{request['subject']} do not exist in prompt: {request['prompt']}")
+            # Ensure subject exists in prompt; fail fast with a clear message
+            if request['subject'] not in request['prompt']:
+                raise ValueError(
+                    f"AlphaEdit: subject '{request['subject']}' not found in prompt: {request['prompt']}"
+                )
         requests[i]['prompt'] = requests[i]['prompt'].replace(requests[i]['subject'], '{}')
         print(
             f"Executing AlphaEdit algo for: "
@@ -193,6 +204,11 @@ def execute_AlphaEdit(
 
         # Get current model activations
         layer_ks = compute_ks(model, tok, requests, hparams, layer, context_templates).T
+        if layer_ks is None or not torch.is_tensor(layer_ks):
+            raise RuntimeError(
+                f"AlphaEdit: failed to compute layer_ks for layer={layer}. "
+                f"Check that prompts contain the subject tokens and fact_token='{hparams.fact_token}'."
+            )
         print(f"Writing {layer_ks.size(1)} key/value pair(s) into layer {layer}")
 
         # Compute residual error
@@ -205,6 +221,10 @@ def execute_AlphaEdit(
             module_template=hparams.layer_module_tmp,
             fact_token_strategy=hparams.fact_token,
         )[1].T
+        if cur_zs is None or not torch.is_tensor(cur_zs):
+            raise RuntimeError(
+                f"AlphaEdit: failed to get layer output representations at z_layer={z_layer}."
+            )
         targets = zs - cur_zs
         print("z error", torch.linalg.norm(targets, dim=0).mean())
 
@@ -239,6 +259,10 @@ def execute_AlphaEdit(
     
     for i, layer in enumerate(hparams.layers):
         layer_ks = compute_ks(model, tok, requests, hparams, layer, context_templates).T
+        if layer_ks is None or not torch.is_tensor(layer_ks):
+            raise RuntimeError(
+                f"AlphaEdit: failed to compute layer_ks for layer={layer} when updating cache_c."
+            )
         cache_c[i,:,:] += layer_ks.cpu() @ layer_ks.cpu().T
 
     # Restore state of original model
@@ -284,7 +308,23 @@ def get_cov(
             hparams=hparams,
             force_recompute=force_recompute,
         )
-        COV_CACHE[key] = stat.mom2.moment().float().to("cpu")
+        # Robustness: if statistics failed to accumulate (e.g., empty batches),
+        # fall back to an identity second-moment so downstream math stays well-defined.
+        try:
+            if getattr(stat, "mom2", None) is None:
+                raise RuntimeError("SecondMoment is empty (no samples added)")
+            cov_t = stat.mom2.moment().float().to("cpu")
+        except Exception as _stat_err:
+            # Determine dimensionality from the target module's weight (input features)
+            try:
+                w = nethook.get_parameter(model, f"{layer_name}.weight")
+                dim = int(w.shape[1]) if w.ndim == 2 else int(w.flatten(0, -2).shape[-1])
+            except Exception:
+                # Conservative fallback if weight lookup fails
+                dim = getattr(model.config, "hidden_size", 4096)
+            cov_t = torch.eye(dim, dtype=torch.float32)
+            print(f"[WARN] get_cov: using identity fallback for {layer_name} (reason: {_stat_err})")
+        COV_CACHE[key] = cov_t
 
     return (
         torch.inverse(COV_CACHE[key].to(f"cuda:{hparams.device}")) if inv else COV_CACHE[key].to(f"cuda:{hparams.device}")
@@ -331,20 +371,50 @@ def get_context_templates(model, tok):
 
 def get_project(model, tok, layer, hparams):
     force_recompute = False
-    cov = get_cov(
-        model,
-        tok,
-        hparams.rewrite_module_tmp.format(layer),
-        hparams.mom2_dataset,
-        hparams.mom2_n_samples
-        if not force_recompute
-        else hparams.mom2_n_samples // 10,
-        hparams.mom2_dtype,
-        force_recompute=force_recompute,
-        hparams=hparams
-    ).cpu()
-    U, S, _ = torch.linalg.svd(cov, full_matrices=False)
-    threshold = hparams.nullspace_threshold
-    small_singular_indices = (S < threshold).nonzero(as_tuple=True)[0]
-    print(len(small_singular_indices))
-    return U[:, small_singular_indices] @ U[:, small_singular_indices].T
+    # Prefer computing the eigen-decomposition on GPU for speed (cov is symmetric PSD)
+    try:
+        cov = get_cov(
+            model,
+            tok,
+            hparams.rewrite_module_tmp.format(layer),
+            hparams.mom2_dataset,
+            hparams.mom2_n_samples if not force_recompute else hparams.mom2_n_samples // 10,
+            hparams.mom2_dtype,
+            force_recompute=force_recompute,
+            hparams=hparams,
+        )
+        # Ensure float32 for stable eigensolver performance
+        cov = cov.to(dtype=torch.float32, device=(f"cuda:{hparams.device}" if torch.cuda.is_available() else "cpu"))
+
+        # For symmetric PSD, eigh is faster than full SVD
+        evals, evecs = torch.linalg.eigh(cov)
+        threshold = hparams.nullspace_threshold
+        small_idx = (evals < threshold).nonzero(as_tuple=True)[0]
+        print(len(small_idx))
+        if small_idx.numel() == 0:
+            # No nullspace under current threshold; return zero projector
+            P = torch.zeros((cov.shape[0], cov.shape[0]), dtype=torch.float32, device=cov.device)
+        else:
+            U_small = evecs[:, small_idx]
+            P = U_small @ U_small.T
+        return P.cpu()
+    except Exception as _eig_err:
+        # Fallback to CPU SVD path if GPU eig fails for any reason
+        cov_cpu = get_cov(
+            model,
+            tok,
+            hparams.rewrite_module_tmp.format(layer),
+            hparams.mom2_dataset,
+            hparams.mom2_n_samples if not force_recompute else hparams.mom2_n_samples // 10,
+            hparams.mom2_dtype,
+            force_recompute=force_recompute,
+            hparams=hparams,
+        ).cpu().to(dtype=torch.float32)
+        U, S, _ = torch.linalg.svd(cov_cpu, full_matrices=False)
+        threshold = hparams.nullspace_threshold
+        small_idx = (S < threshold).nonzero(as_tuple=True)[0]
+        print(len(small_idx))
+        if small_idx.numel() == 0:
+            return torch.zeros((cov_cpu.shape[0], cov_cpu.shape[0]), dtype=torch.float32)
+        U_small = U[:, small_idx]
+        return U_small @ U_small.T

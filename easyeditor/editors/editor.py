@@ -639,4 +639,3 @@ class BaseEditor:
     ):
         metrics = self.apply_algo(datasets, self.hparams)
         return metrics
-

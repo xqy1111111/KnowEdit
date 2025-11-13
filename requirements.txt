@@ -27,3 +27,5 @@ av==14.2.0
 qwen_vl_utils==0.0.10
 zhipuai==2.1.5.20250415
 sentencepiece==0.2.0
+pyarrow==14.0.2
+rouge

@@ -1,0 +1,38 @@
+alg_name: "ULTRAEDIT"
+device: 0
+
+# Model
+# 如为离线/本地环境，请将下方两个名字改为你的本地目录
+model_name: "deepseek-r1d-qwen-7b"
+model_class: AutoModelForCausalLM
+tokenizer_class: AutoTokenizer
+tokenizer_name: "deepseek-r1d-qwen-7b"
+
+inner_params:
+  # Qwen2-7B 系列末三层（25/26/27）MLP：gate 与 up（对 ZSRE/UltraEditBench 通常有效）
+  - model.layers.25.mlp.gate_proj
+  - model.layers.26.mlp.gate_proj
+  - model.layers.27.mlp.gate_proj
+  - model.layers.25.mlp.up_proj
+  - model.layers.26.mlp.up_proj
+  - model.layers.27.mlp.up_proj
+
+# Method
+alg: UltraEdit
+dropout: 0.0
+no_grad_layers: null
+
+lr: 1e-6
+token: mask
+
+batch_size: 100
+batch_size_once: 10
+editor_batch_size: 1024
+silent: False
+half: true
+
+model_parallel: false
+
+# Output
+results_dir: ./results
+

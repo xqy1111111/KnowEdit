@@ -1,0 +1,27 @@
+alg_name: "FT"
+model_name: "/home/xmwang/tmp1/hugging_cache/deepseek-r1d-llama-8b"
+device: 0
+
+# 单点层（中层）；若实现支持多层，可试 [14, 18, 22]
+layers: [14, 18, 22]
+
+num_steps: 50
+batch_size: 1
+max_length: 6144
+lr: 2e-4
+weight_decay: 0.0
+kl_factor: 0.02
+norm_constraint: false
+
+# 对齐整段 alt 的自回归目标
+objective_optimization: "target_new"
+
+# Qwen/R1 模块命名（定点更新）
+rewrite_module_tmp: "model.layers.{}.mlp.down_proj.weight"
+layer_module_tmp:   "model.layers.{}"
+mlp_module_tmp:     "model.layers.{}.mlp"
+attn_module_tmp:    "model.layers.{}.self_attn"
+ln_f_module:        "model.norm"
+lm_head_module:     "lm_head"
+
+model_parallel: false

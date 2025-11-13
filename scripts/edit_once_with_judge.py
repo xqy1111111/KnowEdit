@@ -1,6 +1,7 @@
 # scripts/edit_once_and_judge.py
 # -*- coding: utf-8 -*-
 import os
+import traceback
 import re
 import gc
 import json
@@ -99,6 +100,7 @@ from easyeditor import (
     MEMITHyperParams,
     MENDHyperParams,
     AlphaEditHyperParams,
+    UltraEditHyperParams,
     IKEHyperParams,
 )
 from easyeditor.models.memit import apply_memit_to_model  # type: ignore
@@ -284,7 +286,13 @@ def _safe_load_tokenizer(
 
 
 def ensure_tokenizer_model_vocab_alignment(tokenizer: Any, model: Any, context: str = "") -> bool:
-    """Resize model embeddings if tokenizer length changed; return True if resized."""
+    """Safely align tokenizer and model vocab sizes.
+
+    Policy:
+    - If tokenizer has MORE tokens than embeddings, EXPAND embeddings to match (grow only).
+    - If tokenizer has FEWER tokens than embeddings, DO NOT shrink (that corrupts weights). Just warn.
+    Returns True only when we actually resized (grew) the embeddings.
+    """
     tok = _unwrap_tokenizer(tokenizer) if not isinstance(tokenizer, PreTrainedTokenizerBase) else tokenizer
     if tok is None or model is None:
         return False
@@ -306,9 +314,22 @@ def ensure_tokenizer_model_vocab_alignment(tokenizer: Any, model: Any, context: 
     if tok_size == num_embeddings:
         return False
     prefix = f"{context} " if context else ""
-    warnings.warn(f"{prefix}[vocab] tokenizer={tok_size}, embeddings={num_embeddings}; resizing to match.")
-    resize_fn(tok_size)
-    return True
+    if tok_size > num_embeddings:
+        warnings.warn(f"{prefix}[vocab] tokenizer={tok_size} > embeddings={num_embeddings}; expanding embeddings.")
+        try:
+            resize_fn(tok_size)
+        except Exception as exc:
+            warnings.warn(f"{prefix}[vocab] failed to expand embeddings to {tok_size}: {exc}")
+            return False
+        return True
+    else:
+        name_or_path = getattr(getattr(model, "config", None), "name_or_path", "") or getattr(model, "name_or_path", "")
+        tok_name_or_path = getattr(tokenizer, "name_or_path", "")
+        warnings.warn(
+            f"{prefix}[vocab] tokenizer={tok_size} < embeddings={num_embeddings}; will NOT shrink embeddings. "
+            f"model_from='{name_or_path}' tokenizer_from='{tok_name_or_path}'. Load a matching tokenizer if needed."
+        )
+        return False
 
 
 class StopOnTokens(StoppingCriteria):
@@ -839,6 +860,7 @@ ALG_HP_MAP = {
     "MEMIT": (MEMITHyperParams, "MEMIT"),
     "MEND": (MENDHyperParams, "MEND"),
     "ALPHAEDIT": (AlphaEditHyperParams, "AlphaEdit"),
+    "ULTRAEDIT": (UltraEditHyperParams, "ULTRAEDIT"),
     "IKE": (IKEHyperParams, "IKE"),
 }
 
@@ -1461,6 +1483,18 @@ def run_one_case(
                 raise RuntimeError("stage=infer requires --load_edited_from")
             case_dir = os.path.abspath(os.path.expanduser(load_edited_from))
             base_model_id = case_dir
+            # Validate directory contains a saved model before calling HF loader
+            if not os.path.isdir(case_dir):
+                raise RuntimeError(f"Edited model directory not found: {case_dir}")
+            has_model_files = any(
+                os.path.exists(os.path.join(case_dir, fn))
+                for fn in ("config.json", "pytorch_model.bin", "model.safetensors")
+            )
+            if not has_model_files:
+                raise RuntimeError(
+                    f"Edited model appears incomplete at {case_dir} (missing config.json/model weights). "
+                    f"Ensure the edit stage completed successfully with --save_edited_to."
+                )
             try:
                 tok_for_edit = AutoTokenizer.from_pretrained(case_dir, trust_remote_code=True)
                 ensure_pad_token(tok_for_edit)
@@ -1969,8 +2003,10 @@ def main():
             )
             rec["case_index"] = idx
         except Exception as e:
-            rec = {"case_index": idx, "error": str(e)}
-            warnings.warn(f"[WARN] case {idx} failed: {e}")
+            # Surface a full traceback to help pinpoint the real failure site
+            tb = traceback.format_exc()
+            rec = {"case_index": idx, "error": str(e), "traceback": tb}
+            warnings.warn(f"[WARN] case {idx} failed: {e}\n{tb}")
 
         # 仅在 rank0 打印/写文件，避免多进程重复输出
         if (not is_dist) or dist_rank == 0:

@@ -40,6 +40,12 @@ class MendRewriteExecutor:
         self.alg.load_state_dict(
             {k.replace("gtn.", "mend."): v for k, v in d["model"].items()}
         )
+        # Optional: scale learned edit LRs at inference for stability (default 1.0)
+        try:
+            if hasattr(params, "lr_scale") and isinstance(self.alg.edit_lrs, torch.nn.Parameter):
+                self.alg.edit_lrs.data = self.alg.edit_lrs.data * float(params.lr_scale)
+        except Exception:
+            pass
         # if params.model_parallel:
         self.alg.mend.to(deque(self.alg.model.parameters(), maxlen=1)[0].device)
         # else:
