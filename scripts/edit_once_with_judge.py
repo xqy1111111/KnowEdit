@@ -102,8 +102,7 @@ from easyeditor import (
     AlphaEditHyperParams,
     UltraEditHyperParams,
     IKEHyperParams,
-    DPOHyperParams,
-    RLEditHyperParams,
+    DPOHyperParams
 )
 from easyeditor.models.memit import apply_memit_to_model  # type: ignore
 
@@ -864,8 +863,7 @@ ALG_HP_MAP = {
     "ALPHAEDIT": (AlphaEditHyperParams, "AlphaEdit"),
     "ULTRAEDIT": (UltraEditHyperParams, "ULTRAEDIT"),
     "IKE": (IKEHyperParams, "IKE"),
-    "DPO": (DPOHyperParams, "DPO"),
-    "RLEDIT": (RLEditHyperParams, "RLEDIT"),
+    "DPO": (DPOHyperParams, "DPO")
 }
 
 SUPPORTED_ALG_NAMES = [display for _, display in ALG_HP_MAP.values()]
