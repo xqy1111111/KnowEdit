@@ -102,6 +102,8 @@ from easyeditor import (
     AlphaEditHyperParams,
     UltraEditHyperParams,
     IKEHyperParams,
+    DPOHyperParams,
+    RLEditHyperParams,
 )
 from easyeditor.models.memit import apply_memit_to_model  # type: ignore
 
@@ -862,6 +864,8 @@ ALG_HP_MAP = {
     "ALPHAEDIT": (AlphaEditHyperParams, "AlphaEdit"),
     "ULTRAEDIT": (UltraEditHyperParams, "ULTRAEDIT"),
     "IKE": (IKEHyperParams, "IKE"),
+    "DPO": (DPOHyperParams, "DPO"),
+    "RLEDIT": (RLEditHyperParams, "RLEDIT"),
 }
 
 SUPPORTED_ALG_NAMES = [display for _, display in ALG_HP_MAP.values()]
@@ -1189,6 +1193,23 @@ def run_one_case(
                     except Exception:
                         pass
                 req["loc_prompt"] = chosen
+
+        # DPO 兜底：若未提供 target_neg，则优先用 ground_truth；其次用 alt_answer；最后用一个占位符
+        if alg.upper() == "DPO":
+            if not isinstance(req, dict):
+                req = dict(req)
+            neg = (req.get("target_neg") or "").strip()
+            if not neg:
+                gt = (req.get("ground_truth") or "").strip()
+                new = (req.get("target_new") or "").strip()
+                alt = (req.get("alt_answer") or "").strip()
+                if gt and (not new or gt != new):
+                    neg = gt
+                elif alt and (not new or alt != new):
+                    neg = alt
+                else:
+                    neg = "unknown"
+                req["target_neg"] = neg
 
         is_multi_rank = dist_world_size > 1
         main_rank = (not is_multi_rank) or dist_rank == 0

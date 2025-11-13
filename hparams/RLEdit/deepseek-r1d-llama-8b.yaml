@@ -1,0 +1,30 @@
+alg_name: "RLEDIT"
+model_name: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+device: 0
+
+# Focus top LLaMA MLP blocks (gate/up/down) for local edits
+inner_params:
+  - model.layers.29.mlp.gate_proj
+  - model.layers.29.mlp.up_proj
+  - model.layers.29.mlp.down_proj
+  - model.layers.30.mlp.gate_proj
+  - model.layers.30.mlp.up_proj
+  - model.layers.30.mlp.down_proj
+  - model.layers.31.mlp.gate_proj
+  - model.layers.31.mlp.up_proj
+  - model.layers.31.mlp.down_proj
+
+# Minimal adapter knobs
+token: "ans"
+lr: 5.0e-4
+reg_lambda: 1.0e-3
+rank: 8
+n_blocks: 2
+meta_lr: 1.0e-3
+editor_batch_size: 32
+cache_dir: "/dev/shm/rledit_cache"
+cleanup_cache: true
+
+model_parallel: false
+half: true
+results_dir: ./results
