@@ -1,0 +1,8 @@
+defaults:
+- _self_
+- dataset: zsre
+- model: llama-3-instruct
+- editor: rledit
+num_seq: 400
+model_device: cuda:0
+editor_device: cuda:0
