@@ -6,6 +6,7 @@ import numpy as np
 import os
 
 import torch
+import gc
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from itertools import islice
@@ -69,8 +70,10 @@ class BaseEditor:
 
 
     def reset_model(self):
-        del self.model
-        torch.cuda.empty_cache()
+        if hasattr(self, "model") and self.model is not None:
+            del self.model
+            gc.collect()
+            torch.cuda.empty_cache()
         self.model = make_model(self.config.model).to(self.config.model_device)
 
 
