@@ -976,6 +976,15 @@ def run_rledit_case(
     try:
         cfg, cache_dir = _build_rledit_config(hparam_dict, model_override, sample_path, local_tmp or work_dir)
 
+        # Disable wandb logging inside RLEdit to avoid credential requirements.
+        try:
+            import wandb as _wandb  # type: ignore
+            if getattr(_wandb, "run", None) is None:
+                os.environ.setdefault("WANDB_MODE", "disabled")
+                _wandb.init(mode="disabled")
+        except Exception:
+            pass
+
         train_loader, valid_loader = make_loader_fn(cfg, DatasetCls)
         model = make_model_fn(cfg.model).to(cfg.model_device)
         editor = RLEDIT(cfg, model)
