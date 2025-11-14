@@ -1,4 +1,11 @@
-from datasets import load_metric, load_dataset
+try:
+    from datasets import load_metric, load_dataset
+except ImportError:  # datasets>=2.15 removed load_metric; fallback to evaluate
+    from datasets import load_dataset
+    try:
+        from evaluate import load as load_metric  # type: ignore
+    except Exception as exc:  # pragma: no cover - sanity guard
+        raise ImportError("Neither datasets.load_metric nor evaluate.load is available") from exc
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sklearn.metrics import matthews_corrcoef, f1_score
 from glue_eval.useful_functions import load_data, load_data_split, MODEL_NAME_TO_MAXIMUM_CONTEXT_LENGTH_MAP

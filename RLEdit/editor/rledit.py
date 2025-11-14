@@ -224,7 +224,22 @@ class RLEDIT(BaseEditor):
             with torch.no_grad():
                 mat = keys.T @ keys + net.lamda(layer_idx).exp() * torch.eye(net.key_size, device=self.config.editor_device)
             value_diffs = value_diffs[:keys.shape[0], :]
-            param_shift = torch.linalg.solve(mat, keys.T @ value_diffs)
+            rhs = keys.T @ value_diffs
+            try:
+                param_shift = torch.linalg.solve(mat, rhs)
+            except torch.linalg.LinAlgError:
+                eye = torch.eye(mat.size(0), device=mat.device, dtype=mat.dtype)
+                jitter = 1e-6
+                solved = False
+                for _ in range(5):
+                    try:
+                        param_shift = torch.linalg.solve(mat + jitter * eye, rhs)
+                        solved = True
+                        break
+                    except torch.linalg.LinAlgError:
+                        jitter *= 10
+                if not solved:
+                    param_shift = torch.linalg.lstsq(mat + jitter * eye, rhs).solution
             param_shifts[module_name] = param_shift.to(next(self.model.parameters()).device)
             
         return param_shifts
