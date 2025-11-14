@@ -1272,6 +1272,8 @@ ALG_HP_MAP = {
 }
 
 SUPPORTED_ALG_NAMES = [display for _, display in ALG_HP_MAP.values()]
+if "RLEDIT" not in SUPPORTED_ALG_NAMES:
+    SUPPORTED_ALG_NAMES.append("RLEDIT")
 
 
 def build_editor(alg: str, hparams_path: str, model_name: str) -> BaseEditor:
