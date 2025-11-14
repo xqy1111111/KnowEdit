@@ -1,6 +1,5 @@
 .idea
 hugging_cache
-data
 **/__pycache__
 examples/WikiBio
 examples/wiki_recent
@@ -19,3 +18,7 @@ delta.txt
 **/*_test_reps*
 *test_reps
 *test_reps.*
+hf_cache
+output
+zsre*
+!RLEdit/config/dataset/zsre.yaml
