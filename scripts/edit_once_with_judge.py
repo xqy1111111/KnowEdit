@@ -1028,11 +1028,11 @@ def run_rledit_case(
         answer_match_before: Optional[int] = None
         rewrite_hit_before: Optional[int] = None
         if eval_before:
-                print(f"[RLEDIT] Generating (before) case {req.get('case_index', '')}")
-                pred_before = generate_answer(
-                    editor.model,
-                    tok,
-                    req["prompt"],
+            print(f"[RLEDIT] Generating (before) case {req.get('case_index', '')}")
+            pred_before = generate_answer(
+                editor.model,
+                tok,
+                req["prompt"],
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
