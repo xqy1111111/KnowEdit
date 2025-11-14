@@ -22,3 +22,4 @@ hf_cache
 output
 zsre*
 !RLEdit/config/dataset/zsre.yaml
+!RLEdit/data/zsre.py
