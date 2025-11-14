@@ -1,21 +1,19 @@
 alg_name: "MEMIT"
 
-# Prefer local cache to avoid network in offline setups; otherwise use:
-# model_name: "./hugging_cache/deepseek-r1d-qwen-7b"
-model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-
+# Base model
+model_name: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+device: 0
 stats_dir: "./data/stats"
-device: 0  # overridden by LOCAL_RANK under torchrun when not model_parallel
 
-# Editing layers（取中层，比例与 LLaMA-8B 保持接近）
+# Layers to edit (pick a mid layer for stability on R1D)
 layers: [4, 5, 6, 7, 8]
 layer_selection: "all"
 fact_token: "subject_last"
 
-# v* optimization (MEMIT internal vector solve)
+# v* optimization
 v_num_grad_steps: 80
 v_lr: 5e-2
-v_loss_layer: 27   # Qwen-7B 拥有 28 层（0-27），在靠近输出层约束
+v_loss_layer: 31           # LLaMA-8B has 32 blocks; tie loss near the top
 v_weight_decay: 1e-2
 
 # Regularization / stability
@@ -24,7 +22,7 @@ kl_factor: 0.0625
 mom2_adjustment: true
 mom2_update_weight: 100000
 
-# Module templates (Qwen/LLaMA-style naming)
+# Module templates (LLaMA-style)
 rewrite_module_tmp: "model.layers.{}.mlp.down_proj"
 layer_module_tmp:   "model.layers.{}"
 mlp_module_tmp:     "model.layers.{}.mlp"
@@ -32,10 +30,9 @@ attn_module_tmp:    "model.layers.{}.self_attn"
 ln_f_module:        "model.norm"
 lm_head_module:     "lm_head"
 
-# Second-moment stats for covariance (precomputed/streamed)
+# Second-moment stats
 mom2_dataset: "wikipedia"
 mom2_n_samples: 100000
 mom2_dtype: "float32"
 
-# Runtime
 model_parallel: false

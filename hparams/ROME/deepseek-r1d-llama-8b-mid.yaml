@@ -1,25 +1,25 @@
 alg_name: "ROME"
-model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+model_name: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 stats_dir: "./data/stats"
 device: 0
 
-# 层位：以 7B 为例，取中层±2（更稳）；如需更强或更稳可改为单点 [14]
-layers: [12, 13, 14, 15, 16]
+# 以 8B (32 层, 0..31) 为例，选中层±2 更稳
+layers: [14, 15, 16, 17, 18]
 fact_token: "subject_last"
 
-# 优化超参（稳健域）
+# 优化超参（参考 7B-mid，稍作适配）
 v_num_grad_steps: 25
 v_lr: 3e-1
-v_loss_layer: 27
+v_loss_layer: 31
 v_weight_decay: 1e-3
 clamp_norm_factor: 4
 kl_factor: 0.0625
 
-# 二阶矩（开启更稳，使用缓存统计）
+# 二阶矩统计与上下文采样
 mom2_adjustment: false
 context_template_length_params: [[5, 10], [10, 10]]
 
-# Qwen/R1 模块命名
+# LLaMA/R1 模块命名
 rewrite_module_tmp: "model.layers.{}.mlp.down_proj"
 layer_module_tmp:   "model.layers.{}"
 mlp_module_tmp:     "model.layers.{}.mlp"
@@ -40,3 +40,4 @@ max_memory:
   1: "20GiB"
   2: "20GiB"
   3: "20GiB"
+

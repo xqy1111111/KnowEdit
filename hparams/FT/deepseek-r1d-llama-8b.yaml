@@ -1,22 +1,23 @@
+# Fine-Tune (FT) for DeepSeek-R1-Distill-Llama-8B (single-sample editing)
 alg_name: "FT"
 model_name: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 device: 0
 
-# 单点层（中层）；若实现支持多层，可试 [14, 18, 22]
-layers: [14, 18, 22]
+# Pick a high layer for localized edits; you can try [29, 30, 31]
+layers: [27]
 
-num_steps: 50
-batch_size: 1
-max_length: 6144
-lr: 2e-4
+num_steps: 25
+batch_size: 1            # single editing requires bs=1
+max_length: 4096
+lr: 5e-4
 weight_decay: 0.0
-kl_factor: 0.02
+kl_factor: 0.0
 norm_constraint: false
 
-# 对齐整段 alt 的自回归目标
+# "prompt_last" ~ FT-L; "target_new" ~ FT-M
 objective_optimization: "target_new"
 
-# Qwen/R1 模块命名（定点更新）
+# LLaMA-style module templates
 rewrite_module_tmp: "model.layers.{}.mlp.down_proj.weight"
 layer_module_tmp:   "model.layers.{}"
 mlp_module_tmp:     "model.layers.{}.mlp"
@@ -25,3 +26,4 @@ ln_f_module:        "model.norm"
 lm_head_module:     "lm_head"
 
 model_parallel: false
+

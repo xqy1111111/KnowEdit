@@ -5,12 +5,12 @@ model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 device: 0
 
 # WISE 关键超参（在 7B 上较稳健）
-mask_ratio: 0.18
-edit_lr: 0.50
-n_iter: 100
-norm_constraint: 0.5
-act_margin: [3.0, 12.0, 6.0]   # alpha, beta, gamma
-act_ratio: 0.86
+mask_ratio: 0.15
+edit_lr: 0.35
+n_iter: 120
+norm_constraint: 0.3
+act_margin: [2.0, 8.0, 4.0]
+act_ratio: 0.85
 save_freq: 500
 merge_freq: 1000
 merge_alg: 'ties'
@@ -21,7 +21,7 @@ inner_params:
   - model.layers[27].mlp.down_proj.weight
 
 # 可选：合并/检索
-densities: 0.52
+densities: 0.50
 weights: 1.0
 retrieve: False
 replay: False

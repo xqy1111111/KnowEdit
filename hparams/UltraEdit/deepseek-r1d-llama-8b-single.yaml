@@ -1,0 +1,39 @@
+  alg_name: "ULTRAEDIT"
+  device: 0
+
+  # Model
+  model_name: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+  model_class: AutoModelForCausalLM
+  tokenizer_class: AutoTokenizer
+  tokenizer_name: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+
+  inner_params:
+    # Focus top Llama blocks for edits (29-31)
+    - model.layers.29.mlp.gate_proj
+    - model.layers.30.mlp.gate_proj
+    - model.layers.31.mlp.gate_proj
+    - model.layers.29.mlp.up_proj
+    - model.layers.30.mlp.up_proj
+    - model.layers.31.mlp.up_proj
+
+  # Method
+  alg: UltraEdit
+  dropout: 0.0
+  no_grad_layers: null
+
+  # 单样本（Single Editing）要求 batch_size=1
+  batch_size: 1
+  batch_size_once: 1
+  editor_batch_size: 1024
+
+  lr: 1e-6
+  token: mask
+
+  silent: False
+  half: true
+
+  model_parallel: false
+
+  # Output
+  results_dir: ./results
+
