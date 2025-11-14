@@ -1028,10 +1028,11 @@ def run_rledit_case(
         answer_match_before: Optional[int] = None
         rewrite_hit_before: Optional[int] = None
         if eval_before:
-            pred_before = generate_answer(
-                editor.model,
-                tok,
-                req["prompt"],
+                print(f"[RLEDIT] Generating (before) case {req.get('case_index', '')}")
+                pred_before = generate_answer(
+                    editor.model,
+                    tok,
+                    req["prompt"],
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
@@ -1064,6 +1065,7 @@ def run_rledit_case(
         editor.apply_loader_once(valid_loader)
         ensure_tokenizer_model_vocab_alignment(tok, editor.model, context="[rledit_after]")
 
+        print(f"[RLEDIT] Generating (after) case {req.get('case_index', '')}")
         pred_after = generate_answer(
             editor.model,
             tok,
