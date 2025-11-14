@@ -1,6 +1,7 @@
 # scripts/edit_once_and_judge.py
 # -*- coding: utf-8 -*-
 import os
+import sys
 import traceback
 import re
 import gc
@@ -10,6 +11,9 @@ import argparse
 import warnings
 import unicodedata
 import shutil
+import tempfile
+
+import yaml
 """
 Environment safety: ensure Hugging Face caches point to a writable location by default.
 This avoids errors like:
@@ -72,9 +76,17 @@ def _ensure_hf_caches():
 
 # Ensure caches are set before any HF/torch imports that may consult them.
 _ensure_hf_caches()
+
+try:
+    REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+except Exception:
+    REPO_ROOT = os.getcwd()
+RLEDIT_DIR = os.path.join(REPO_ROOT, "RLEdit")
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple, Union
 from datetime import timedelta
+
+from omegaconf import OmegaConf
 
 import torch
 import torch.nn as nn
@@ -772,6 +784,399 @@ def read_zsre_like(path: str) -> List[Dict[str, Any]]:
         reqs.append(req)
     return reqs
 
+# ===================== RLEdit 集成 =====================
+def _load_yaml_file(path: str) -> Dict[str, Any]:
+    if not path:
+        return {}
+    with open(path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected dict in YAML file {path}, got {type(data).__name__}")
+    return data
+
+
+def _resolve_rledit_device(device_val: Any) -> str:
+    override = os.environ.get("RLEDIT_DEVICE")
+    if override:
+        return override
+    if device_val is None:
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    if isinstance(device_val, str):
+        if device_val.startswith("cuda") or device_val.lower() == "cpu":
+            return device_val
+        try:
+            return f"cuda:{int(device_val)}"
+        except Exception:
+            return device_val
+    try:
+        return f"cuda:{int(device_val)}"
+    except Exception:
+        return "cuda:0"
+
+
+def _convert_req_to_rledit_sample(req: Dict[str, Any]) -> Dict[str, str]:
+    prompt = req.get("prompt") or req.get("src") or ""
+    rephrase_field = req.get("rephrase")
+    if isinstance(rephrase_field, list) and rephrase_field:
+        rephrase_text = rephrase_field[0]
+    elif isinstance(rephrase_field, str) and rephrase_field.strip():
+        rephrase_text = rephrase_field
+    else:
+        rephrase_text = prompt
+    locality_prompt = ""
+    locality_answer = ""
+    locality = req.get("locality") or {}
+    if isinstance(locality, dict):
+        nq = locality.get("nq") or {}
+        if isinstance(nq, dict):
+            locality_prompt = nq.get("prompt", "")
+            locality_answer = nq.get("ground_truth", "")
+    return {
+        "src": prompt,
+        "rephrase": rephrase_text or prompt,
+        "ans": req.get("target_new") or req.get("alt") or "",
+        "loc": locality_prompt,
+        "loc_ans": locality_answer,
+    }
+
+
+def _import_rledit_components():
+    if not os.path.isdir(RLEDIT_DIR):
+        raise RuntimeError(f"RLEdit directory not found at {RLEDIT_DIR}")
+    if RLEDIT_DIR not in sys.path:
+        sys.path.append(RLEDIT_DIR)
+    from data.zsre import ZSREDataset  # type: ignore
+    from data.base import make_loader  # type: ignore
+    from model import make_model  # type: ignore
+    from editor.rledit import RLEDIT  # type: ignore
+    from util import empty_cache  # type: ignore
+
+    return RLEDIT, ZSREDataset, make_loader, make_model, empty_cache
+
+
+def _build_rledit_config(
+    hparams: Dict[str, Any],
+    model_override: str,
+    sample_path: str,
+    cache_root: str,
+) -> Tuple[Any, str]:
+    config_dir = os.path.join(RLEDIT_DIR, "config")
+    dataset_name = hparams.get("dataset") or hparams.get("dataset_name") or "zsre"
+    dataset_cfg_path = os.path.join(config_dir, "dataset", f"{dataset_name}.yaml")
+    if not os.path.exists(dataset_cfg_path):
+        raise FileNotFoundError(f"RLEdit dataset config not found: {dataset_cfg_path}")
+    dataset_cfg = OmegaConf.load(dataset_cfg_path)
+    dataset_cfg.train_path = sample_path
+    dataset_cfg.valid_path = sample_path
+    dataset_cfg.n_edits = max(1, int(hparams.get("dataset_n_edits", hparams.get("n_edits", 1))))
+    dataset_cfg.batch_size = max(1, int(hparams.get("dataset_batch_size", hparams.get("batch_size", 1))))
+
+    model_key = hparams.get("model_key") or "llama-3-instruct"
+    model_cfg_path = os.path.join(config_dir, "model", f"{model_key}.yaml")
+    if not os.path.exists(model_cfg_path):
+        raise FileNotFoundError(f"RLEdit model config not found: {model_cfg_path}")
+    model_cfg = OmegaConf.load(model_cfg_path)
+    model_name = model_override or hparams.get("model_name") or model_cfg.get("name_or_path")
+    if not model_name:
+        raise ValueError("RLEdit requires model_name in hparams or --model override")
+    model_cfg.name_or_path = model_name
+    model_cfg.name = os.path.basename(model_name.rstrip("/")) or model_name
+    if hparams.get("inner_params"):
+        model_cfg.edit_modules = hparams["inner_params"]
+    if "half" in hparams:
+        model_cfg.half = bool(hparams["half"])
+
+    editor_cfg_path = os.path.join(config_dir, "editor", "rledit.yaml")
+    editor_cfg = OmegaConf.load(editor_cfg_path)
+    mapping = {
+        "rank": "rank",
+        "n_blocks": "n_blocks",
+        "lr": "lr",
+        "meta_lr": "meta_lr",
+        "token": "token",
+        "loc_coef": "loc_coef",
+        "time_decay": "time_decay",
+        "back_depth": "back_depth",
+        "full_curve": "full_curve",
+        "save_checkpoint": "save_checkpoint",
+        "load_checkpoint": "load_checkpoint",
+    }
+    for hp_key, cfg_key in mapping.items():
+        if hp_key in hparams:
+            editor_cfg[cfg_key] = hparams[hp_key]
+    if "editor_batch_size" in hparams:
+        editor_cfg.batch_size = max(1, int(hparams["editor_batch_size"]))
+    if "reg_lambda" in hparams:
+        editor_cfg.reg_coef = hparams["reg_lambda"]
+    if "n_epochs" in hparams:
+        editor_cfg.n_epochs = max(1, int(hparams["n_epochs"]))
+
+    cache_dir = hparams.get("cache_dir")
+    if cache_dir:
+        cache_dir = os.path.abspath(os.path.expanduser(cache_dir))
+    else:
+        cache_dir = os.path.join(cache_root, "rledit_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    editor_cfg.cache_dir = cache_dir
+
+    device_str = _resolve_rledit_device(hparams.get("device"))
+    cfg = OmegaConf.create(
+        {
+            "num_seq": max(1, int(hparams.get("num_seq", dataset_cfg.n_edits))),
+            "glue_step": int(hparams.get("glue_step", 0)),
+            "model_device": device_str,
+            "editor_device": device_str,
+        }
+    )
+    cfg.dataset = dataset_cfg
+    cfg.model = model_cfg
+    cfg.editor = editor_cfg
+    return cfg, cache_dir
+
+
+def run_rledit_case(
+    req: Dict[str, Any],
+    hparams: str,
+    model_override: str,
+    generation_cfg: GenerationConfig,
+    judge_manager: Optional["JudgeManager"],
+    eval_before: bool,
+    skip_locality: bool,
+    no_judge: bool,
+    stage: str,
+    save_edited_to: str = "",
+    delete_saved_after: bool = False,
+    save_tag: str = "",
+) -> Dict[str, Any]:
+    stage = (stage or "full").lower()
+    if stage != "full":
+        raise ValueError("RLEDIT 当前仅支持 stage=full。")
+    if save_edited_to:
+        warnings.warn("[RLEDIT] 当前集成暂不支持保存编辑后模型，忽略 --save_edited_to。")
+    if delete_saved_after:
+        warnings.warn("[RLEDIT] 当前集成暂不支持 delete_saved_after，忽略该选项。")
+
+    hparam_dict = _load_yaml_file(hparams)
+    cleanup_cache = bool(hparam_dict.get("cleanup_cache", False))
+    local_tmp = os.environ.get("LOCAL_SSD_ROOT", os.path.expanduser("~/autodl-tmp"))
+    if local_tmp:
+        try:
+            os.makedirs(local_tmp, exist_ok=True)
+        except Exception:
+            pass
+    work_dir = tempfile.mkdtemp(prefix="rledit_case.", dir=local_tmp if os.path.isdir(local_tmp) else None)
+    sample_path = os.path.join(work_dir, "case.json")
+    sample = _convert_req_to_rledit_sample(req)
+    with open(sample_path, "w", encoding="utf-8") as fh:
+        json.dump([sample], fh, ensure_ascii=False, indent=2)
+
+    RLEDIT, DatasetCls, make_loader_fn, make_model_fn, empty_cache_fn = _import_rledit_components()
+    cfg = None
+    cache_dir = ""
+    try:
+        cfg, cache_dir = _build_rledit_config(hparam_dict, model_override, sample_path, local_tmp or work_dir)
+
+        train_loader, valid_loader = make_loader_fn(cfg, DatasetCls)
+        model = make_model_fn(cfg.model).to(cfg.model_device)
+        editor = RLEDIT(cfg, model)
+
+        os.environ.setdefault("WANDB_DISABLED", "true")
+        epochs = max(1, int(getattr(cfg.editor, "n_epochs", 1)))
+        for _ in range(epochs):
+            editor.train(train_loader)
+
+        editor.reset_model()
+
+        tok = AutoTokenizer.from_pretrained(cfg.model.name_or_path, trust_remote_code=True)
+        ensure_pad_token(tok)
+        ensure_tokenizer_model_vocab_alignment(tok, editor.model, context="[rledit_editor]")
+
+        gen_mode = generation_cfg.mode
+        max_new_tokens = generation_cfg.max_new_tokens
+        temperature = generation_cfg.temperature
+        top_p = generation_cfg.top_p
+        target_new_text = req.get("target_new", "") or ""
+        alt_answer_text = req.get("alt_answer", "") or ""
+        alt_answer_norm = _normalize_for_match(alt_answer_text) if alt_answer_text else ""
+
+        judge_tok: Optional[AutoTokenizer] = None
+        judge_model: Optional[AutoModelForCausalLM] = None
+        judge_loaded = False
+
+        def _ensure_judge_loaded():
+            nonlocal judge_tok, judge_model, judge_loaded
+            if no_judge or judge_loaded or judge_manager is None:
+                return
+            jt, jm = judge_manager.load()
+            judge_tok, judge_model = jt, jm
+            judge_loaded = True
+
+        pred_before = ""
+        final_short_before = ""
+        reasoning_before = ""
+        a_for_score_before = ""
+        llm_judge_before: Optional[int] = None
+        answer_match_before: Optional[int] = None
+        rewrite_hit_before: Optional[int] = None
+        if eval_before:
+            pred_before = generate_answer(
+                editor.model,
+                tok,
+                req["prompt"],
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                mode=gen_mode,
+            )
+            if gen_mode in {"reason", "r1d"}:
+                final_short_before, reasoning_before = extract_final(pred_before)
+            else:
+                final_short_before = pred_before
+                reasoning_before = ""
+            a_for_score_before = final_short_before or pred_before
+            if not no_judge and a_for_score_before and judge_manager is not None:
+                _ensure_judge_loaded()
+                golds_before = [g for g in [target_new_text, alt_answer_text] if g]
+                if golds_before and judge_tok is not None and judge_model is not None:
+                    llm_judge_before = judge_hit(
+                        judge_tok,
+                        judge_model,
+                        question=req["prompt"],
+                        final=a_for_score_before,
+                        golds=golds_before,
+                    )
+            if alt_answer_norm and final_short_before:
+                answer_match_before = int(_normalize_for_match(final_short_before) == alt_answer_norm)
+            if llm_judge_before is not None or answer_match_before is not None:
+                rewrite_hit_before = int(
+                    int(llm_judge_before or 0) > 0 or int(answer_match_before or 0) > 0
+                )
+
+        editor.sequential_valid(valid_loader)
+        ensure_tokenizer_model_vocab_alignment(tok, editor.model, context="[rledit_after]")
+
+        pred_after = generate_answer(
+            editor.model,
+            tok,
+            req["prompt"],
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            mode=gen_mode,
+        )
+        reasoning_after = ""
+        if gen_mode in {"reason", "r1d"}:
+            final_short_after, reasoning_after = extract_final(pred_after)
+        else:
+            final_short_after = pred_after
+        a_for_score_after = final_short_after or pred_after
+
+        llm_judge_after: Optional[int] = None
+        if not no_judge and a_for_score_after and judge_manager is not None:
+            _ensure_judge_loaded()
+            golds_after = [g for g in [target_new_text, alt_answer_text] if g]
+            if golds_after and judge_tok is not None and judge_model is not None:
+                llm_judge_after = judge_hit(
+                    judge_tok,
+                    judge_model,
+                    question=req["prompt"],
+                    final=a_for_score_after,
+                    golds=golds_after,
+                )
+
+        answer_match_after: Optional[int] = None
+        if alt_answer_norm and final_short_after:
+            answer_match_after = int(_normalize_for_match(final_short_after) == alt_answer_norm)
+
+        rewrite_hit_after: Optional[int] = None
+        if llm_judge_after is not None or answer_match_after is not None:
+            rewrite_hit_after = int(
+                int(llm_judge_after or 0) > 0 or int(answer_match_after or 0) > 0
+            )
+
+        loc_rec: Dict[str, Any] = {}
+        if (not skip_locality) and isinstance(req.get("locality"), dict) and "nq" in req["locality"]:
+            lp = req["locality"]["nq"].get("prompt", "")
+            lg = req["locality"]["nq"].get("ground_truth", "")
+            if lp and lg:
+                loc_pred = generate_answer(
+                    editor.model,
+                    tok,
+                    lp,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    mode=gen_mode,
+                )
+                loc_final, _ = extract_final(loc_pred) if gen_mode in {"reason", "r1d"} else (loc_pred, "")
+                loc_hit = None
+                if not no_judge and judge_manager is not None and loc_final:
+                    _ensure_judge_loaded()
+                    if judge_tok is not None and judge_model is not None:
+                        loc_hit = judge_hit(
+                            judge_tok,
+                            judge_model,
+                            question=lp,
+                            final=(loc_final or loc_pred),
+                            golds=[lg],
+                        )
+                loc_rec = {
+                    "loc_prompt": lp,
+                    "loc_gold": lg,
+                    "pred_loc": loc_pred,
+                    "final_loc": loc_final or "",
+                    "locality_hit": (int(loc_hit) if loc_hit is not None else None),
+                }
+
+        rec: Dict[str, Any] = {
+            "prompt": req["prompt"],
+            "target_new": target_new_text,
+            "pred_after": pred_after,
+            "rewrite_hit": int(rewrite_hit_after) if rewrite_hit_after is not None else None,
+            "easyedit_metrics": {"rledit_epochs": epochs},
+        }
+        if gen_mode in {"reason", "r1d"}:
+            if final_short_after:
+                rec["final_after"] = final_short_after
+            if reasoning_after:
+                rec["reasoning_or_think_after"] = reasoning_after
+        elif final_short_after:
+            rec["final_after"] = final_short_after
+        if llm_judge_after is not None:
+            rec["llm_judge_after"] = int(llm_judge_after)
+        if answer_match_after is not None:
+            rec["answer_match_after"] = int(answer_match_after)
+
+        if eval_before:
+            rec["pred_before"] = pred_before
+            rec["rewrite_hit_before"] = int(rewrite_hit_before) if rewrite_hit_before is not None else None
+            if llm_judge_before is not None:
+                rec["llm_judge_before"] = int(llm_judge_before)
+            if answer_match_before is not None:
+                rec["answer_match_before"] = int(answer_match_before)
+            if gen_mode in {"reason", "r1d"}:
+                if final_short_before:
+                    rec["final_before"] = final_short_before
+                if reasoning_before:
+                    rec["reasoning_or_think_before"] = reasoning_before
+            elif final_short_before:
+                rec["final_before"] = final_short_before
+
+        rec.update(loc_rec)
+        rec.setdefault("loc_prompt", "")
+        rec.setdefault("loc_gold", "")
+        rec.setdefault("pred_loc", "")
+        rec.setdefault("locality_hit", None)
+
+        return rec
+    finally:
+        if cleanup_cache and cfg is not None and empty_cache_fn is not None:
+            try:
+                empty_cache_fn(cache_dir or (cfg.editor.cache_dir if hasattr(cfg, "editor") else ""), cfg)
+            except Exception:
+                pass
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
 # ===================== 主语 =====================
 _SUBJ_PATTERNS = [
     re.compile(r'(?:did|does|was|is|were|has|have)\s+([A-Z][a-z]+(?: [A-Z][a-z]+){0,6})'),
@@ -1118,6 +1523,21 @@ def run_one_case(
     load_edited_from: str = "",
     train_ds: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    if alg.upper() == "RLEDIT":
+        return run_rledit_case(
+            req=req,
+            hparams=hparams,
+            model_override=model_override,
+            generation_cfg=generation_cfg,
+            judge_manager=judge_manager,
+            eval_before=eval_before,
+            skip_locality=skip_locality,
+            no_judge=no_judge,
+            stage=stage,
+            save_edited_to=save_edited_to,
+            delete_saved_after=delete_saved_after,
+            save_tag=save_tag,
+        )
 
     gen_mode = generation_cfg.mode
     max_new_tokens = generation_cfg.max_new_tokens

@@ -1,7 +1,8 @@
 import os
 
-# You can specify the GPU you are using here
-os.environ['CUDA_VISIBLE_DEVICES'] =  '0'
+# Respect existing CUDA_VISIBLE_DEVICES if user already set it; default to GPU 0 otherwise.
+if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 from omegaconf import DictConfig
 
