@@ -1061,7 +1061,7 @@ def run_rledit_case(
                     int(llm_judge_before or 0) > 0 or int(answer_match_before or 0) > 0
                 )
 
-        editor.sequential_valid(valid_loader)
+        editor.apply_loader_once(valid_loader)
         ensure_tokenizer_model_vocab_alignment(tok, editor.model, context="[rledit_after]")
 
         pred_after = generate_answer(

@@ -315,6 +315,21 @@ class BaseEditor:
         })
 
 
+    def apply_loader_once(self, loader: DataLoader):
+        """Apply edits for the first batch in loader without computing metrics."""
+        iterator = iter(loader)
+        try:
+            tuples = next(iterator)
+        except StopIteration:
+            raise RuntimeError("RLEdit valid loader is empty; nothing to apply")
+
+        self.cache(tuples["edit_tuples"])
+        param_shifts = self.predict_param_shifts()
+        self.edit_model(param_shifts, False)
+        self.tuples_list.append(tuples)
+        self.opt.zero_grad()
+
+
     def run(self, train_loader: DataLoader, valid_loader: DataLoader):
         """
         Use MEND or MALMEN to complete sequential editing task.
