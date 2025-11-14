@@ -1028,7 +1028,7 @@ def run_rledit_case(
         answer_match_before: Optional[int] = None
         rewrite_hit_before: Optional[int] = None
         if eval_before:
-            print(f"[RLEDIT] Generating (before) case {req.get('case_index', '')}")
+            print(f"[RLEDIT] Generating (before) case {req.get('case_index', '')}", flush=True)
             pred_before = generate_answer(
                 editor.model,
                 tok,
@@ -1065,7 +1065,7 @@ def run_rledit_case(
         editor.apply_loader_once(valid_loader)
         ensure_tokenizer_model_vocab_alignment(tok, editor.model, context="[rledit_after]")
 
-        print(f"[RLEDIT] Generating (after) case {req.get('case_index', '')}")
+        print(f"[RLEDIT] Generating (after) case {req.get('case_index', '')}", flush=True)
         pred_after = generate_answer(
             editor.model,
             tok,
