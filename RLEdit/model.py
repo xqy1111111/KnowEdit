@@ -21,7 +21,14 @@ def make_model(config: DictConfig):
     model = model_class.from_pretrained(config.name_or_path)
 
     if config.half:
-        model.bfloat16()
+        dtype_name = getattr(config, "dtype", None) or os.environ.get("RLEDIT_DTYPE") or "bfloat16"
+        dtype_name = dtype_name.lower()
+        if dtype_name in {"fp16", "float16", "half"}:
+            model = model.half()
+        elif dtype_name in {"bf16", "bfloat16"}:
+            model = model.bfloat16()
+        else:
+            raise ValueError(f"Unsupported dtype '{dtype_name}' for RLEdit model")
 
     for param in model.parameters():
         param.requires_grad = False
