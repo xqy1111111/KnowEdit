@@ -71,13 +71,17 @@ def main() -> None:
         raise SystemExit("No data available to build RLEdit folds")
 
     folds = max(1, int(args.folds))
-    fold_ranges = _compute_fold_ranges(len(reqs), folds)
-    fold_idx = max(0, min(int(args.fold_index), len(fold_ranges) - 1))
-    holdout_range = fold_ranges[fold_idx]
-
-    holdout_indices = set(holdout_range)
-    train_data = [_convert_to_rledit_sample(req) for idx, req in enumerate(reqs) if idx not in holdout_indices]
-    holdout_data = [_convert_to_rledit_sample(req) for idx, req in enumerate(reqs) if idx in holdout_indices]
+    if folds <= 1:
+        train_data = [_convert_to_rledit_sample(req) for req in reqs]
+        holdout_data: List[Dict[str, str]] = []
+        fold_idx = 0
+    else:
+        fold_ranges = _compute_fold_ranges(len(reqs), folds)
+        fold_idx = max(0, min(int(args.fold_index), len(fold_ranges) - 1))
+        holdout_range = fold_ranges[fold_idx]
+        holdout_indices = set(holdout_range)
+        train_data = [_convert_to_rledit_sample(req) for idx, req in enumerate(reqs) if idx not in holdout_indices]
+        holdout_data = [_convert_to_rledit_sample(req) for idx, req in enumerate(reqs) if idx in holdout_indices]
 
     os.makedirs(os.path.dirname(os.path.abspath(args.train_out)), exist_ok=True)
     with open(args.train_out, "w", encoding="utf-8") as fh:
