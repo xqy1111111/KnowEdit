@@ -1,5 +1,6 @@
 alg_name: "ROME"
-model_name: "Qwen/Qwen2.5-Math-7B-SimpleRL"
+model_name: "hkust-nlp/Qwen-2.5-Math-7B-SimpleRL"
+tokenizer_name: "hkust-nlp/Qwen-2.5-Math-7B-SimpleRL"
 stats_dir: "./data/stats"
 device: 0
 
