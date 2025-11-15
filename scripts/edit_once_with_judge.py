@@ -995,19 +995,9 @@ def run_rledit_case(
         if train_override:
             cfg.dataset.train_path = train_override
             if not valid_override:
-                cfg.dataset.valid_path = train_override
+                valid_override = train_override
         if valid_override:
             cfg.dataset.valid_path = valid_override
-        if train_override:
-            cnt = _count_rledit_items(train_override)
-            if cnt > 0:
-                cfg.dataset.n_edits = max(1, cnt)
-                cfg.dataset.num_seq = max(1, cnt)
-                try:
-                    batch_sz = int(cfg.dataset.batch_size)
-                except Exception:
-                    batch_sz = 1
-                cfg.dataset.batch_size = max(1, min(batch_sz, int(cfg.dataset.n_edits)))
 
         # Disable wandb logging inside RLEdit to avoid credential requirements.
         try:
