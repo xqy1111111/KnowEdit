@@ -75,6 +75,41 @@ if [ ! -f "$TRAIN_SUBSET" ] || [ "${RLEDIT_REBUILD_TRAIN:-0}" -eq 1 ]; then
     --folds 1 --fold_index 0 \
     --train_out "$TRAIN_SUBSET" > "$LOCAL_SSD_ROOT/rledit_train_subset_meta.json"
 fi
+SUBSET_COUNT=$(TRAIN_SUBSET="$TRAIN_SUBSET" python - <<'PY'
+import json, os
+path = os.environ.get("TRAIN_SUBSET", "")
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    data = []
+print(len(data))
+PY
+)
+if [ "${SUBSET_COUNT}" -le 0 ]; then
+  echo "[RLEDIT] Warning: training subset empty (start=$RLEDIT_TRAIN_START). Rebuilding from start=0." >&2
+  python -m scripts.build_rledit_kfold \
+    --data_path "$DATA" \
+    --start 0 \
+    --limit "$RLEDIT_TRAIN_COUNT" \
+    --folds 1 --fold_index 0 \
+    --train_out "$TRAIN_SUBSET" > "$LOCAL_SSD_ROOT/rledit_train_subset_meta.json"
+  SUBSET_COUNT=$(TRAIN_SUBSET="$TRAIN_SUBSET" python - <<'PY'
+import json, os
+path = os.environ.get("TRAIN_SUBSET", "")
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    data = []
+print(len(data))
+PY
+  )
+fi
+if [ "${SUBSET_COUNT}" -le 0 ]; then
+  echo "[RLEDIT] ERROR: training subset still empty. Check DATA/limit settings." >&2
+  exit 1
+fi
 export RLEDIT_TRAIN_PATH="$TRAIN_SUBSET"
 unset RLEDIT_VALID_PATH
 
