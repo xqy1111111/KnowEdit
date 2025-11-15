@@ -20,9 +20,9 @@ set -euo pipefail
 START_IDX=${1:-0}
 COUNT=${2:-1}
 
-GPU=${GPU:-0}
+GPU=${GPU:-1}
 HPARAMS=${HPARAMS:-"hparams/RLEdit/deepseek-r1d-llama-8b.yaml"}
-DATA=${DATA:-"znoncot.json"}
+DATA=${DATA:-"data/noncot.json"}
 OUT_JSONL=${OUT_JSONL:-"output/rledit_llama8b.jsonl"}
 
 GEN_MODE=${GEN_MODE:-r1d}
@@ -30,8 +30,13 @@ MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
 TEMPERATURE=${TEMPERATURE:-0}
 TOP_P=${TOP_P:-1}
 PRINT_EVERY=${PRINT_EVERY:-1}
+RLEDIT_TRAIN_START=${RLEDIT_TRAIN_START:-500}
+RLEDIT_TRAIN_COUNT=${RLEDIT_TRAIN_COUNT:-0}
+RLEDIT_CKPT_DIR=${RLEDIT_CKPT_DIR:-"/data1/rledit_ckpt"}
+CKPT_TAG_DEFAULT=$(basename "${HPARAMS%.*}")
+RLEDIT_CKPT_TAG=${RLEDIT_CKPT_TAG:-$CKPT_TAG_DEFAULT}
 
-LOCAL_SSD_ROOT=${LOCAL_SSD_ROOT:-"$HOME/autodl-tmp"}
+LOCAL_SSD_ROOT=${LOCAL_SSD_ROOT:-"/data1"}
 mkdir -p "$LOCAL_SSD_ROOT"
 export LOCAL_SSD_ROOT
 
@@ -48,7 +53,30 @@ mkdir -p "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" || 
 
 export TOKENIZERS_PARALLELISM=false
 export WANDB_DISABLED=${WANDB_DISABLED:-true}
+export RLEDIT_DTYPE=fp16
 mkdir -p "$(dirname "$OUT_JSONL")" || true
+
+mkdir -p "$RLEDIT_CKPT_DIR"
+export RLEDIT_CKPT_DIR RLEDIT_CKPT_TAG
+CKPT_NET="$RLEDIT_CKPT_DIR/${RLEDIT_CKPT_TAG}_net.pth"
+CKPT_OPT="$RLEDIT_CKPT_DIR/${RLEDIT_CKPT_TAG}_opt.pth"
+if [ -f "$CKPT_NET" ] && [ -f "$CKPT_OPT" ]; then
+  export RLEDIT_SKIP_TRAIN=${RLEDIT_SKIP_TRAIN:-1}
+else
+  export RLEDIT_SKIP_TRAIN=${RLEDIT_SKIP_TRAIN:-0}
+fi
+
+TRAIN_SUBSET="$LOCAL_SSD_ROOT/rledit_train_subset.json"
+if [ ! -f "$TRAIN_SUBSET" ] || [ "${RLEDIT_REBUILD_TRAIN:-0}" -eq 1 ]; then
+  python -m scripts.build_rledit_kfold \
+    --data_path "$DATA" \
+    --start "$RLEDIT_TRAIN_START" \
+    --limit "$RLEDIT_TRAIN_COUNT" \
+    --folds 1 --fold_index 0 \
+    --train_out "$TRAIN_SUBSET" > "$LOCAL_SSD_ROOT/rledit_train_subset_meta.json"
+fi
+export RLEDIT_TRAIN_PATH="$TRAIN_SUBSET"
+unset RLEDIT_VALID_PATH
 
 for ((i=0; i<COUNT; i++)); do
   IDX=$((START_IDX + i))
@@ -64,6 +92,9 @@ for ((i=0; i<COUNT; i++)); do
     --save_jsonl "$OUT_JSONL" \
     --print_every "$PRINT_EVERY" \
     --stage full
+  if [ "${RLEDIT_SKIP_TRAIN}" != "1" ] && [ -f "$CKPT_NET" ] && [ -f "$CKPT_OPT" ]; then
+    export RLEDIT_SKIP_TRAIN=1
+  fi
   echo
   sleep 1
 done

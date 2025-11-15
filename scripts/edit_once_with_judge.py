@@ -840,6 +840,17 @@ def _convert_req_to_rledit_sample(req: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def _count_rledit_items(path: str) -> int:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            return len(data)
+    except Exception:
+        pass
+    return 0
+
+
 def _import_rledit_components():
     if not os.path.isdir(RLEDIT_DIR):
         raise RuntimeError(f"RLEdit directory not found at {RLEDIT_DIR}")
@@ -969,12 +980,34 @@ def run_rledit_case(
     sample = _convert_req_to_rledit_sample(req)
     with open(sample_path, "w", encoding="utf-8") as fh:
         json.dump([sample], fh, ensure_ascii=False, indent=2)
+    case_tag = req.get("case_index")
+    if case_tag is None:
+        case_tag = req.get("case_id") or req.get("subject") or ""
 
     RLEDIT, DatasetCls, make_loader_fn, make_model_fn, empty_cache_fn = _import_rledit_components()
     cfg = None
     cache_dir = ""
     try:
         cfg, cache_dir = _build_rledit_config(hparam_dict, model_override, sample_path, local_tmp or work_dir)
+
+        train_override = os.environ.get("RLEDIT_TRAIN_PATH", "").strip()
+        valid_override = os.environ.get("RLEDIT_VALID_PATH", "").strip()
+        if train_override:
+            cfg.dataset.train_path = train_override
+            if not valid_override:
+                cfg.dataset.valid_path = train_override
+        if valid_override:
+            cfg.dataset.valid_path = valid_override
+        if train_override:
+            cnt = _count_rledit_items(train_override)
+            if cnt > 0:
+                cfg.dataset.n_edits = max(1, cnt)
+                cfg.dataset.num_seq = max(1, cnt)
+                try:
+                    batch_sz = int(cfg.dataset.batch_size)
+                except Exception:
+                    batch_sz = 1
+                cfg.dataset.batch_size = max(1, min(batch_sz, int(cfg.dataset.n_edits)))
 
         # Disable wandb logging inside RLEdit to avoid credential requirements.
         try:
@@ -985,14 +1018,63 @@ def run_rledit_case(
         except Exception:
             pass
 
-        train_loader, valid_loader = make_loader_fn(cfg, DatasetCls)
+        train_loader, _ = make_loader_fn(cfg, DatasetCls)
         model = make_model_fn(cfg.model).to(cfg.model_device)
         editor = RLEDIT(cfg, model)
 
         os.environ.setdefault("WANDB_DISABLED", "true")
+
+        ckpt_dir = os.environ.get("RLEDIT_CKPT_DIR", "").strip()
+        ckpt_tag = os.environ.get("RLEDIT_CKPT_TAG") or os.path.splitext(os.path.basename(hparams))[0]
+        if ckpt_dir:
+            ckpt_dir = os.path.abspath(os.path.expanduser(ckpt_dir))
+            os.makedirs(ckpt_dir, exist_ok=True)
+        local_ckpt_dir = os.path.join(RLEDIT_DIR, "checkpoints")
+        os.makedirs(local_ckpt_dir, exist_ok=True)
+        base_name = f"{cfg.model.name}_{cfg.editor.name}_{cfg.dataset.n_edits}"
+        local_net_path = os.path.join(local_ckpt_dir, f"{base_name}_net.pth")
+        local_opt_path = os.path.join(local_ckpt_dir, f"{base_name}_opt.pth")
+        external_net_path = os.path.join(ckpt_dir, f"{ckpt_tag}_net.pth") if ckpt_dir else ""
+        external_opt_path = os.path.join(ckpt_dir, f"{ckpt_tag}_opt.pth") if ckpt_dir else ""
+
+        if external_net_path and os.path.exists(external_net_path) and external_opt_path and os.path.exists(external_opt_path):
+            try:
+                shutil.copy2(external_net_path, local_net_path)
+                shutil.copy2(external_opt_path, local_opt_path)
+            except Exception as copy_exc:
+                warnings.warn(f"[RLEDIT] 无法复制已有 checkpoint：{copy_exc}")
+
+        loaded_ckpt = False
+        if os.path.exists(local_net_path) and os.path.exists(local_opt_path):
+            try:
+                editor.net.load_state_dict(torch.load(local_net_path, map_location=cfg.editor_device))
+                editor.opt.load_state_dict(torch.load(local_opt_path, map_location=cfg.editor_device))
+                loaded_ckpt = True
+                print(f"[RLEDIT] Loaded hypernetwork checkpoint from {local_net_path}", flush=True)
+            except Exception as load_exc:
+                warnings.warn(f"[RLEDIT] 加载 checkpoint 失败，将重新训练：{load_exc}")
+                loaded_ckpt = False
+
+        skip_training_env = os.environ.get("RLEDIT_SKIP_TRAIN", "0") == "1"
+        skip_training = loaded_ckpt and skip_training_env
+
         epochs = max(1, int(getattr(cfg.editor, "n_epochs", 1)))
-        for _ in range(epochs):
-            editor.train(train_loader)
+        if skip_training:
+            print(f"[RLEDIT] 使用缓存超网络，跳过训练（case {case_tag}）", flush=True)
+        else:
+            print(f"[RLEDIT] Training case {case_tag} (epochs={epochs})", flush=True)
+            for _ in range(epochs):
+                editor.train(train_loader)
+            print(f"[RLEDIT] Training done for case {case_tag}", flush=True)
+            try:
+                torch.save(editor.net.state_dict(), local_net_path)
+                torch.save(editor.opt.state_dict(), local_opt_path)
+                if external_net_path:
+                    shutil.copy2(local_net_path, external_net_path)
+                if external_opt_path:
+                    shutil.copy2(local_opt_path, external_opt_path)
+            except Exception as save_exc:
+                warnings.warn(f"[RLEDIT] 保存 checkpoint 失败：{save_exc}")
 
         editor.reset_model()
 
@@ -1062,7 +1144,24 @@ def run_rledit_case(
                     int(llm_judge_before or 0) > 0 or int(answer_match_before or 0) > 0
                 )
 
-        editor.apply_loader_once(valid_loader)
+        # Build single-sample loader for applying the edit
+        sample_cfg = OmegaConf.create({
+            "dataset": copy.deepcopy(cfg.dataset),
+            "model": cfg.model,
+            "editor": cfg.editor,
+            "num_seq": 1,
+            "model_device": cfg.model_device,
+            "editor_device": cfg.editor_device,
+        })
+        sample_cfg.dataset.train_path = sample_path
+        sample_cfg.dataset.valid_path = sample_path
+        sample_cfg.dataset.n_edits = 1
+        sample_cfg.dataset.batch_size = 1
+        edit_loader, _ = make_loader_fn(sample_cfg, DatasetCls)
+
+        print(f"[RLEDIT] Applying edit for case {case_tag}", flush=True)
+        editor.apply_loader_once(edit_loader)
+        print(f"[RLEDIT] Edit applied for case {case_tag}", flush=True)
         ensure_tokenizer_model_vocab_alignment(tok, editor.model, context="[rledit_after]")
 
         print(f"[RLEDIT] Generating (after) case {req.get('case_index', '')}", flush=True)
@@ -2428,6 +2527,7 @@ def main():
                 break
 
         req = copy.deepcopy(all_reqs[idx])
+        req["case_index"] = idx
         try:
             rec = run_one_case(
                 req=req,
