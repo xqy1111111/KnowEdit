@@ -1016,6 +1016,7 @@ def run_rledit_case(
 
         ckpt_dir = os.environ.get("RLEDIT_CKPT_DIR", "").strip()
         ckpt_tag = os.environ.get("RLEDIT_CKPT_TAG") or os.path.splitext(os.path.basename(hparams))[0]
+        force_retrain = os.environ.get("RLEDIT_FORCE_RETRAIN", "0") == "1"
         if ckpt_dir:
             ckpt_dir = os.path.abspath(os.path.expanduser(ckpt_dir))
             os.makedirs(ckpt_dir, exist_ok=True)
@@ -1027,7 +1028,14 @@ def run_rledit_case(
         external_net_path = os.path.join(ckpt_dir, f"{ckpt_tag}_net.pth") if ckpt_dir else ""
         external_opt_path = os.path.join(ckpt_dir, f"{ckpt_tag}_opt.pth") if ckpt_dir else ""
 
-        if external_net_path and os.path.exists(external_net_path) and external_opt_path and os.path.exists(external_opt_path):
+        if force_retrain:
+            for stale_path in (local_net_path, local_opt_path):
+                try:
+                    if os.path.exists(stale_path):
+                        os.remove(stale_path)
+                except Exception:
+                    pass
+        elif external_net_path and os.path.exists(external_net_path) and external_opt_path and os.path.exists(external_opt_path):
             try:
                 shutil.copy2(external_net_path, local_net_path)
                 shutil.copy2(external_opt_path, local_opt_path)
@@ -1035,7 +1043,7 @@ def run_rledit_case(
                 warnings.warn(f"[RLEDIT] 无法复制已有 checkpoint：{copy_exc}")
 
         loaded_ckpt = False
-        if os.path.exists(local_net_path) and os.path.exists(local_opt_path):
+        if (not force_retrain) and os.path.exists(local_net_path) and os.path.exists(local_opt_path):
             try:
                 editor.net.load_state_dict(torch.load(local_net_path, map_location=cfg.editor_device))
                 editor.opt.load_state_dict(torch.load(local_opt_path, map_location=cfg.editor_device))
@@ -1046,7 +1054,7 @@ def run_rledit_case(
                 loaded_ckpt = False
 
         skip_training_env = os.environ.get("RLEDIT_SKIP_TRAIN", "0") == "1"
-        skip_training = loaded_ckpt and skip_training_env
+        skip_training = loaded_ckpt and skip_training_env and (not force_retrain)
 
         epochs = max(1, int(getattr(cfg.editor, "n_epochs", 1)))
         if skip_training:

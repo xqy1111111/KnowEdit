@@ -14,14 +14,22 @@ inner_params:
   - model.layers.31.mlp.up_proj
   - model.layers.31.mlp.down_proj
 
-# Minimal adapter knobs
+# Hypernetwork training schedule (matches RLEdit/config defaults)
+n_edits: 64
+dataset_n_edits: 64
+batch_size: 64
+dataset_batch_size: 64
+num_seq: 64
+n_epochs: 3
+
+# Adapter / optimizer knobs
 token: "ans"
-lr: 5.0e-4
-reg_lambda: 1.0e-3
-rank: 8
+lr: 2.0e-6
+reg_lambda: 1.0e-4
+rank: 256
 n_blocks: 2
-meta_lr: 1.0e-3
-editor_batch_size: 32
+meta_lr: 1.0e-5
+editor_batch_size: 64
 cache_dir: "/dev/shm/rledit_cache"
 cleanup_cache: true
 
