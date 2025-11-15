@@ -1,12 +1,12 @@
 name: rledit
-rank: 1024
-n_blocks: 4
-lr: 1e-6
+rank: 256
+n_blocks: 2
+lr: 2e-6
 meta_lr: 1e-5
 loc_coef: 0.6
 max_grad_norm: 1
-n_epochs: 1
-batch_size: 128
+n_epochs: 3
+batch_size: 64
 token: ans
 cache_dir: cache
 save_checkpoint: False

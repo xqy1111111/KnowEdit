@@ -3,6 +3,6 @@ defaults:
 - dataset: zsre
 - model: llama-3-instruct
 - editor: rledit
-num_seq: 400
+num_seq: 64
 model_device: cuda:0
 editor_device: cuda:0
