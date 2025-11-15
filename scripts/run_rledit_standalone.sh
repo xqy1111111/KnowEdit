@@ -30,8 +30,6 @@ MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
 TEMPERATURE=${TEMPERATURE:-0}
 TOP_P=${TOP_P:-1}
 PRINT_EVERY=${PRINT_EVERY:-1}
-RLEDIT_TRAIN_START=${RLEDIT_TRAIN_START:-500}
-RLEDIT_TRAIN_COUNT=${RLEDIT_TRAIN_COUNT:-0}
 RLEDIT_CKPT_DIR=${RLEDIT_CKPT_DIR:-"/data1/rledit_ckpt"}
 CKPT_TAG_DEFAULT=$(basename "${HPARAMS%.*}")
 RLEDIT_CKPT_TAG=${RLEDIT_CKPT_TAG:-$CKPT_TAG_DEFAULT}
@@ -66,52 +64,18 @@ else
   export RLEDIT_SKIP_TRAIN=${RLEDIT_SKIP_TRAIN:-0}
 fi
 
-TRAIN_SUBSET="$LOCAL_SSD_ROOT/rledit_train_subset.json"
-if [ ! -f "$TRAIN_SUBSET" ] || [ "${RLEDIT_REBUILD_TRAIN:-0}" -eq 1 ]; then
-  python -m scripts.build_rledit_kfold \
-    --data_path "$DATA" \
-    --start "$RLEDIT_TRAIN_START" \
-    --limit "$RLEDIT_TRAIN_COUNT" \
-    --folds 1 --fold_index 0 \
-    --train_out "$TRAIN_SUBSET" > "$LOCAL_SSD_ROOT/rledit_train_subset_meta.json"
-fi
-SUBSET_COUNT=$(TRAIN_SUBSET="$TRAIN_SUBSET" python - <<'PY'
-import json, os
-path = os.environ.get("TRAIN_SUBSET", "")
-try:
-    with open(path, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-except Exception:
-    data = []
-print(len(data))
-PY
-)
-if [ "${SUBSET_COUNT}" -le 0 ]; then
-  echo "[RLEDIT] Warning: training subset empty (start=$RLEDIT_TRAIN_START). Rebuilding from start=0." >&2
-  python -m scripts.build_rledit_kfold \
-    --data_path "$DATA" \
-    --start 0 \
-    --limit "$RLEDIT_TRAIN_COUNT" \
-    --folds 1 --fold_index 0 \
-    --train_out "$TRAIN_SUBSET" > "$LOCAL_SSD_ROOT/rledit_train_subset_meta.json"
-  SUBSET_COUNT=$(TRAIN_SUBSET="$TRAIN_SUBSET" python - <<'PY'
-import json, os
-path = os.environ.get("TRAIN_SUBSET", "")
-try:
-    with open(path, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-except Exception:
-    data = []
-print(len(data))
-PY
-  )
-fi
-if [ "${SUBSET_COUNT}" -le 0 ]; then
-  echo "[RLEDIT] ERROR: training subset still empty. Check DATA/limit settings." >&2
+DEFAULT_TRAIN=${RLEDIT_TRAIN_PATH:-"data/mend/zsre_mend_train.json"}
+DEFAULT_VALID=${RLEDIT_VALID_PATH:-"data/mend/zsre_mend_eval.json"}
+if [ ! -f "$DEFAULT_TRAIN" ]; then
+  echo "[RLEDIT] ERROR: training file $DEFAULT_TRAIN not found. Set RLEDIT_TRAIN_PATH." >&2
   exit 1
 fi
-export RLEDIT_TRAIN_PATH="$TRAIN_SUBSET"
-unset RLEDIT_VALID_PATH
+if [ ! -f "$DEFAULT_VALID" ]; then
+  echo "[RLEDIT] WARNING: validation file $DEFAULT_VALID not found; falling back to training set." >&2
+  DEFAULT_VALID="$DEFAULT_TRAIN"
+fi
+export RLEDIT_TRAIN_PATH="$DEFAULT_TRAIN"
+export RLEDIT_VALID_PATH="$DEFAULT_VALID"
 
 for ((i=0; i<COUNT; i++)); do
   IDX=$((START_IDX + i))
