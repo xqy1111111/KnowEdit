@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Any
 
 import torch
 
@@ -8,6 +8,16 @@ from data.base import BaseDataset
 class ZSREDataset(BaseDataset):
     """ZSRE-style samples with edit/equiv/locality prompts."""
 
+    @staticmethod
+    def _first_non_empty(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    return item.strip()
+        return ""
+
     def __getitem__(self, idx) -> Dict[str, Dict[str, torch.LongTensor]]:
         row = self.data[idx]
         prompt = row.get("src") or row.get("prompt") or ""
@@ -15,9 +25,11 @@ class ZSREDataset(BaseDataset):
         locality_prompt = row.get("loc") or row.get("loc_prompt") or ""
         answer = (
             row.get("ans")
-            or row.get("alt")
             or row.get("target_new")
             or row.get("new_answer")
+            or self._first_non_empty(row.get("answers"))
+            or row.get("pred")
+            or row.get("alt")
             or ""
         )
         locality_answer = (

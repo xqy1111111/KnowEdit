@@ -39,12 +39,14 @@ def get_shape(module: Union[nn.Linear, Conv1D]) -> Tuple[int]:
 def cross_entropy(
     logits: torch.FloatTensor,
     labels: torch.LongTensor
-):
+) -> torch.Tensor:
     if len(logits.shape) == 2:
         return F.binary_cross_entropy_with_logits(logits, labels)
 
     if len(logits.shape) == 3:
         ans_indice = torch.where(labels != -100)
+        if ans_indice[0].numel() == 0:
+            return logits.sum() * 0
         logits = logits[ans_indice]
         labels = labels[ans_indice]
         
@@ -68,6 +70,8 @@ def kl_div(
     
     if len(logits.shape) == 3:
         ans_indice = torch.where(labels != -100)
+        if ans_indice[0].numel() == 0:
+            return logits.sum() * 0
         refer_logits = refer_logits[ans_indice]
         logits = logits[ans_indice]
         refer_log_probs = refer_logits.log_softmax(-1)
