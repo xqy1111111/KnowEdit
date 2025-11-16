@@ -1,0 +1,5 @@
+name: noncot
+n_edits: 20
+batch_size: 4
+train_path: data/noncot.json
+valid_path: data/noncot.json

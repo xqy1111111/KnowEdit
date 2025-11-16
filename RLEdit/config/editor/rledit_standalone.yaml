@@ -1,4 +1,4 @@
-name: rledit
+name: rledit_standalone
 rank: 1024
 n_blocks: 4
 lr: 1e-6
