@@ -2,13 +2,16 @@ alg_name: "RLEDIT"
 model_name: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 device: 0
 
-# Focus LLaMA-3-8B blocks (gate[11-15], up[18-24]) per RLEdit Table 3
+# 按 RLEdit 论文在 LLaMA-3-8B + ZsRE 上的设置来：gate[11-15], up[18-24]
 inner_params:
+  # gate blocks 11-15 (中层 gate，负责“分流”信息)
   - model.layers.11.mlp.gate_proj
   - model.layers.12.mlp.gate_proj
   - model.layers.13.mlp.gate_proj
   - model.layers.14.mlp.gate_proj
   - model.layers.15.mlp.gate_proj
+
+  # up blocks 18-24 (稍深 up，负责“写入”新特征)
   - model.layers.18.mlp.up_proj
   - model.layers.19.mlp.up_proj
   - model.layers.20.mlp.up_proj
@@ -17,30 +20,26 @@ inner_params:
   - model.layers.23.mlp.up_proj
   - model.layers.24.mlp.up_proj
 
-# Hypernetwork training schedule (matches RLEdit/config defaults)
-n_edits: 64
-dataset_n_edits: 64
-batch_size: 64
-dataset_batch_size: 64
+# ==== 超网络训练规模 ====
+# 80G + 8B：可以用比 64 大得多的 n_edits
+n_edits: 256
+dataset_n_edits: 256
+batch_size: 32
+dataset_batch_size: 32
 num_seq: 64
 n_epochs: 3
 
-# Adapter / optimizer knobs
+# ==== Adapter / optimizer ====
 token: "ans"
-lr: 1.0e-6
+lr: 1.0e-5
+meta_lr: 1.0e-4
 reg_lambda: 1.0e-4
 rank: 512
 n_blocks: 2
-meta_lr: 1.0e-5
 editor_batch_size: 32
+
 cache_dir: "/dev/shm/rledit_cache"
 cleanup_cache: true
-
-# Dataset-specific localization strength (Table 3)
-loc_coef:
-  zsre: 0.6
-  counterfact: 0.8
-  fever: 0.8
 
 model_parallel: false
 half: true
