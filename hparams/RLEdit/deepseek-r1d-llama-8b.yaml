@@ -2,17 +2,20 @@ alg_name: "RLEDIT"
 model_name: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 device: 0
 
-# Focus top LLaMA MLP blocks (gate/up/down) for local edits
+# Focus LLaMA-3-8B blocks (gate[11-15], up[18-24]) per RLEdit Table 3
 inner_params:
-  - model.layers.29.mlp.gate_proj
-  - model.layers.29.mlp.up_proj
-  - model.layers.29.mlp.down_proj
-  - model.layers.30.mlp.gate_proj
-  - model.layers.30.mlp.up_proj
-  - model.layers.30.mlp.down_proj
-  - model.layers.31.mlp.gate_proj
-  - model.layers.31.mlp.up_proj
-  - model.layers.31.mlp.down_proj
+  - model.layers.11.mlp.gate_proj
+  - model.layers.12.mlp.gate_proj
+  - model.layers.13.mlp.gate_proj
+  - model.layers.14.mlp.gate_proj
+  - model.layers.15.mlp.gate_proj
+  - model.layers.18.mlp.up_proj
+  - model.layers.19.mlp.up_proj
+  - model.layers.20.mlp.up_proj
+  - model.layers.21.mlp.up_proj
+  - model.layers.22.mlp.up_proj
+  - model.layers.23.mlp.up_proj
+  - model.layers.24.mlp.up_proj
 
 # Hypernetwork training schedule (matches RLEdit/config defaults)
 n_edits: 64
@@ -24,14 +27,20 @@ n_epochs: 3
 
 # Adapter / optimizer knobs
 token: "ans"
-lr: 2.0e-6
+lr: 1.0e-6
 reg_lambda: 1.0e-4
-rank: 256
+rank: 512
 n_blocks: 2
 meta_lr: 1.0e-5
-editor_batch_size: 64
+editor_batch_size: 32
 cache_dir: "/dev/shm/rledit_cache"
 cleanup_cache: true
+
+# Dataset-specific localization strength (Table 3)
+loc_coef:
+  zsre: 0.6
+  counterfact: 0.8
+  fever: 0.8
 
 model_parallel: false
 half: true
