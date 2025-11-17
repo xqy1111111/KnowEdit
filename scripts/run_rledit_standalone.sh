@@ -20,7 +20,7 @@ set -euo pipefail
 START_IDX=${1:-0}
 COUNT=${2:-1}
 
-GPU=${GPU:-1}
+GPU=${GPU:-0  }
 HPARAMS=${HPARAMS:-"hparams/RLEdit/deepseek-r1d-llama-8b.yaml"}
 DATA=${DATA:-"data/noncot.json"}
 OUT_JSONL=${OUT_JSONL:-"output/rledit_llama8b.jsonl"}
@@ -30,13 +30,13 @@ MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
 TEMPERATURE=${TEMPERATURE:-0}
 TOP_P=${TOP_P:-1}
 PRINT_EVERY=${PRINT_EVERY:-1}
-RLEDIT_CKPT_DIR=${RLEDIT_CKPT_DIR:-"/data1/rledit_ckpt"}
+RLEDIT_CKPT_DIR=${RLEDIT_CKPT_DIR:-"/root/autodl-tmp/rledit_ckpt"}
 CKPT_TAG_DEFAULT=$(basename "${HPARAMS%.*}")
 RLEDIT_CKPT_TAG=${RLEDIT_CKPT_TAG:-$CKPT_TAG_DEFAULT}
 RLEDIT_FORCE_RETRAIN=${RLEDIT_FORCE_RETRAIN:-0}
 export RLEDIT_FORCE_RETRAIN
 
-LOCAL_SSD_ROOT=${LOCAL_SSD_ROOT:-"/data1"}
+LOCAL_SSD_ROOT=${LOCAL_SSD_ROOT:-"/root/autodl-tmp"}
 mkdir -p "$LOCAL_SSD_ROOT"
 export LOCAL_SSD_ROOT
 

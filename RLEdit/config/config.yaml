@@ -6,3 +6,4 @@ defaults:
 num_seq: 400
 model_device: cuda:0
 editor_device: cuda:0
+glue_step: 0

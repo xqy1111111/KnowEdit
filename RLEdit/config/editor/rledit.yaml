@@ -8,8 +8,8 @@ max_grad_norm: 1
 n_epochs: 1
 batch_size: 128
 token: ans
-cache_dir: /dev/shm/rledit_cache
-save_checkpoint: False
+cache_dir: /root/KnowEdit/RLEdit/cache
+save_checkpoint: True
 load_checkpoint: False
 n_test: 10
 reg_coef: 1e-4

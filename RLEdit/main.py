@@ -6,7 +6,7 @@ from model import make_model
 import wandb
 
 
-@hydra.main(version_base=None, config_path="config", config_name="config")
+@hydra.main(config_path="config", config_name="config")
 def main(config: DictConfig):
     
     wandb.init(

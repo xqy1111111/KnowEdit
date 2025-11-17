@@ -2,45 +2,41 @@ alg_name: "RLEDIT"
 model_name: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 device: 0
 
-# 按 RLEdit 论文在 LLaMA-3-8B + ZsRE 上的设置来：gate[11-15], up[18-24]
+# ==== 更保守的编辑区域（先试 4 层 gate+up）====
 inner_params:
-  # gate blocks 11-15 (中层 gate，负责“分流”信息)
-  - model.layers.11.mlp.gate_proj
-  - model.layers.12.mlp.gate_proj
-  - model.layers.13.mlp.gate_proj
-  - model.layers.14.mlp.gate_proj
-  - model.layers.15.mlp.gate_proj
+  - model.layers.26.mlp.gate_proj
+  - model.layers.26.mlp.up_proj
+  - model.layers.27.mlp.gate_proj
+  - model.layers.27.mlp.up_proj
+  - model.layers.28.mlp.gate_proj
+  - model.layers.28.mlp.up_proj
+  - model.layers.29.mlp.gate_proj
+  - model.layers.29.mlp.up_proj
 
-  # up blocks 18-24 (稍深 up，负责“写入”新特征)
-  - model.layers.18.mlp.up_proj
-  - model.layers.19.mlp.up_proj
-  - model.layers.20.mlp.up_proj
-  - model.layers.21.mlp.up_proj
-  - model.layers.22.mlp.up_proj
-  - model.layers.23.mlp.up_proj
-  - model.layers.24.mlp.up_proj
+# ==== 超网络训练规模（小步试水版）====
+n_edits: 20            # 和你刚才一样，先小规模
+dataset_n_edits: 20
+batch_size: 2          # 减小 batch，减少单步梯度冲击
+dataset_batch_size: 2
+num_seq: 20
+n_epochs: 1            # 先跑 1 epoch，确认不炸再加
 
-# ==== 超网络训练规模 ====
-# 80G + 8B：可以用比 64 大得多的 n_edits
-n_edits: 256
-dataset_n_edits: 256
-batch_size: 32
-dataset_batch_size: 32
-num_seq: 64
-n_epochs: 3
+# ==== Adapter / optimizer（大幅收敛保守化）====
+token: "ans"           # 暂且保留，如果你数据里没有这个 special token 再一起改
+lr: 5.0e-7             # 比你原来的再小一档，降低对基础 LM 的冲击
+meta_lr: 5.0e-6
+reg_lambda: 1.0e-3     # 正则加大一个量级，强行收敛到小步更新
+rank: 128              # 从 1024 降到 128，先保证不毁模型
+n_blocks: 1            # 只用一个超网 block，先确保稳定
+editor_batch_size: 16  # 内部编辑 batch 也减小
+loc_coef: 0.3          # 降低 locality loss 权重，避免为守住局部过度 push 权重
+max_grad_norm: 0.5     # 更严格的梯度裁剪
 
-# ==== Adapter / optimizer ====
-token: "ans"
-lr: 1.0e-5
-meta_lr: 1.0e-4
-reg_lambda: 1.0e-4
-rank: 512
-n_blocks: 2
-editor_batch_size: 32
 
-cache_dir: "/dev/shm/rledit_cache"
+cache_dir: "/root/KnowEdit/RLEdit/cache"
+
 cleanup_cache: true
 
 model_parallel: false
-half: true
+half: false            # 关键：先全 float32 跑一轮，看是不是数值炸
 results_dir: ./results
