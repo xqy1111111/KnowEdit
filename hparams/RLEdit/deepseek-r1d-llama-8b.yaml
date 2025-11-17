@@ -1,42 +1,51 @@
 alg_name: "RLEDIT"
 model_name: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+model_key: "deepseek-r1d"
 device: 0
 
-# ==== 更保守的编辑区域（先试 4 层 gate+up）====
+# 参考 RLEdit config（llama-3 + ZSRE）：gate[22-30], up[22-30]
 inner_params:
+  - model.layers.22.mlp.gate_proj
+  - model.layers.23.mlp.gate_proj
+  - model.layers.24.mlp.gate_proj
+  - model.layers.25.mlp.gate_proj
   - model.layers.26.mlp.gate_proj
-  - model.layers.26.mlp.up_proj
   - model.layers.27.mlp.gate_proj
-  - model.layers.27.mlp.up_proj
   - model.layers.28.mlp.gate_proj
-  - model.layers.28.mlp.up_proj
   - model.layers.29.mlp.gate_proj
+  - model.layers.30.mlp.gate_proj
+  - model.layers.22.mlp.up_proj
+  - model.layers.23.mlp.up_proj
+  - model.layers.24.mlp.up_proj
+  - model.layers.25.mlp.up_proj
+  - model.layers.26.mlp.up_proj
+  - model.layers.27.mlp.up_proj
+  - model.layers.28.mlp.up_proj
   - model.layers.29.mlp.up_proj
+  - model.layers.30.mlp.up_proj
 
-# ==== 超网络训练规模（小步试水版）====
-n_edits: 20            # 和你刚才一样，先小规模
+# ==== 超网络训练规模 ====
+n_edits: 20
 dataset_n_edits: 20
-batch_size: 2          # 减小 batch，减少单步梯度冲击
-dataset_batch_size: 2
-num_seq: 20
-n_epochs: 1            # 先跑 1 epoch，确认不炸再加
+batch_size: 4
+dataset_batch_size: 4
+num_seq: 400
+n_epochs: 1
 
-# ==== Adapter / optimizer（大幅收敛保守化）====
-token: "ans"           # 暂且保留，如果你数据里没有这个 special token 再一起改
-lr: 5.0e-7             # 比你原来的再小一档，降低对基础 LM 的冲击
-meta_lr: 5.0e-6
-reg_lambda: 1.0e-3     # 正则加大一个量级，强行收敛到小步更新
-rank: 128              # 从 1024 降到 128，先保证不毁模型
-n_blocks: 1            # 只用一个超网 block，先确保稳定
-editor_batch_size: 16  # 内部编辑 batch 也减小
-loc_coef: 0.3          # 降低 locality loss 权重，避免为守住局部过度 push 权重
-max_grad_norm: 0.5     # 更严格的梯度裁剪
-
+# ==== Adapter / optimizer ====
+token: "ans"
+lr: 1.0e-6
+meta_lr: 1.0e-5
+reg_lambda: 1.0e-4
+rank: 1024
+n_blocks: 4
+editor_batch_size: 128
+loc_coef: 0.6
+max_grad_norm: 1.0
 
 cache_dir: "/root/KnowEdit/RLEdit/cache"
-
 cleanup_cache: true
 
 model_parallel: false
-half: false            # 关键：先全 float32 跑一轮，看是不是数值炸
+half: true
 results_dir: ./results
