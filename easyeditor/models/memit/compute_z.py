@@ -91,19 +91,19 @@ def compute_z(
         nonlocal target_init
 
         if cur_layer == hparams.layer_module_tmp.format(layer):
+            layer_out = cur_out[0] if isinstance(cur_out, (tuple, list)) else cur_out
+
             # Store initial value of the vector of interest
             if target_init is None:
                 print("Recording initial value of v*")
-                # Initial value is recorded for the clean sentence
-                target_init = cur_out[0][0, lookup_idxs[0]].detach().clone()
+                target_init = layer_out[0, lookup_idxs[0]].detach().clone()
 
             # Add intervened delta
             for i, idx in enumerate(lookup_idxs):
-
-                if len(lookup_idxs)!=len(cur_out[0]):
-                    cur_out[0][idx, i, :] += delta
+                if len(lookup_idxs) != layer_out.shape[0]:
+                    layer_out[idx, i, :] += delta
                 else:
-                    cur_out[0][i, idx, :] += delta
+                    layer_out[i, idx, :] += delta
 
         return cur_out
 
@@ -141,10 +141,31 @@ def compute_z(
 
         # Compute loss on rewriting targets
 
-        output=tr[hparams.layer_module_tmp.format(loss_layer)].output[0]
-        if output.shape[1]!=rewriting_targets.shape[1]:
-            output=torch.transpose(output, 0, 1)
-        full_repr = output[:len(rewriting_prompts)]
+        output_obj = tr[hparams.layer_module_tmp.format(loss_layer)].output
+        if isinstance(output_obj, (tuple, list)):
+            output_tensor = output_obj[0]
+        else:
+            output_tensor = output_obj
+
+        if output_tensor.dim() != 3:
+            raise RuntimeError(
+                f"Unexpected hidden state rank {output_tensor.dim()} at layer {loss_layer}; "
+                "expected 3-D tensor (batch, seq, hidden)."
+            )
+
+        batch_sz, seq_len, _ = output_tensor.shape
+        desired_batch = len(all_prompts)
+        desired_seq = rewriting_targets.shape[1]
+
+        if batch_sz != desired_batch and seq_len == desired_batch:
+            output_tensor = output_tensor.transpose(0, 1)
+            batch_sz, seq_len = output_tensor.shape[:2]
+
+        if seq_len != desired_seq and batch_sz == desired_seq:
+            output_tensor = output_tensor.transpose(0, 1)
+            batch_sz, seq_len = output_tensor.shape[:2]
+
+        full_repr = output_tensor[:len(rewriting_prompts)]
 
         log_probs = torch.log_softmax(ln_f(full_repr) @ lm_w.to(full_repr.device) + lm_b.to(full_repr.device), dim=2)
         loss = torch.gather(

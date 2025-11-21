@@ -129,13 +129,28 @@ def generate_fast(
             else:
                 logits = model_out.logits
             past_key_values = model_out.past_key_values
-            softmax_out = torch.nn.functional.softmax(logits[:, -1, :], dim=1)
+            # 为数值稳定，使用 float32 计算 softmax，避免半精度下极端值导致 NaN/Inf
+            last_logits = logits[:, -1, :].float()
+            softmax_out = torch.nn.functional.softmax(last_logits, dim=1)
 
             # Top-k sampling
-            tk = torch.topk(softmax_out, top_k, dim=1).indices
+            k = min(max(1, int(top_k)), softmax_out.size(1))
+            tk = torch.topk(softmax_out, k, dim=1).indices
             softmax_out_top_k = torch.gather(softmax_out, 1, tk)
-            softmax_out_top_k = softmax_out_top_k / softmax_out_top_k.sum(1)[:, None]
-            new_tok_indices = torch.multinomial(softmax_out_top_k, 1)
+            # 归一化时加上极小值，避免全 0 导致除零
+            denom = softmax_out_top_k.sum(1, keepdim=True)
+            denom = denom + (denom == 0).float()
+            probs_topk = torch.clamp(softmax_out_top_k / denom, min=0.0)
+
+            # 若仍出现无效概率（NaN/Inf），回退为贪心选择 top-1
+            if not torch.isfinite(probs_topk).all() or torch.isnan(probs_topk).any():
+                new_tok_indices = torch.zeros((probs_topk.size(0), 1), dtype=torch.long, device=probs_topk.device)
+            else:
+                try:
+                    new_tok_indices = torch.multinomial(probs_topk, 1)
+                except RuntimeError:
+                    # multinomial 失败时回退为 top-1
+                    new_tok_indices = torch.zeros((probs_topk.size(0), 1), dtype=torch.long, device=probs_topk.device)
             new_toks = torch.gather(tk, 1, new_tok_indices)
 
             # If we're currently generating the continuation for the last token in `input_ids`,

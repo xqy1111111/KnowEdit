@@ -345,6 +345,34 @@ def ensure_tokenizer_model_vocab_alignment(tokenizer: Any, model: Any, context: 
         return False
 
 
+def _maybe_append_eos_to_target(req: Dict[str, Any], tok: AutoTokenizer, enable: bool) -> Dict[str, Any]:
+    """Optionally append tokenizer.eos_token to target_new/memit_bundle target_new fields."""
+    if not enable or tok is None:
+        return req
+    eos_tok = getattr(tok, "eos_token", None)
+    if not eos_tok:
+        return req
+
+    def _append_one(target: str) -> str:
+        t = target or ""
+        if not t.endswith(eos_tok):
+            t = (t + " " + eos_tok).strip()
+        return t
+
+    req = dict(req)
+    if isinstance(req.get("target_new"), str):
+        req["target_new"] = _append_one(req["target_new"])
+    if isinstance(req.get("memit_bundle"), list):
+        new_bundle = []
+        for item in req["memit_bundle"]:
+            item = dict(item)
+            if isinstance(item.get("target_new"), str):
+                item["target_new"] = _append_one(item["target_new"])
+            new_bundle.append(item)
+        req["memit_bundle"] = new_bundle
+    return req
+
+
 class StopOnTokens(StoppingCriteria):
     """Stop generation when any of the stop token sequences appears at the tail."""
 
@@ -1118,7 +1146,7 @@ def run_rledit_case(
                 top_p=top_p,
                 mode=gen_mode,
             )
-            if gen_mode in {"reason", "r1d"}:
+            if gen_mode in THINKING_GEN_MODES:
                 final_short_before, reasoning_before = extract_final(pred_before)
             else:
                 final_short_before = pred_before
@@ -1173,7 +1201,7 @@ def run_rledit_case(
             mode=gen_mode,
         )
         reasoning_after = ""
-        if gen_mode in {"reason", "r1d"}:
+        if gen_mode in THINKING_GEN_MODES:
             final_short_after, reasoning_after = extract_final(pred_after)
         else:
             final_short_after = pred_after
@@ -1216,7 +1244,7 @@ def run_rledit_case(
                     top_p=top_p,
                     mode=gen_mode,
                 )
-                loc_final, _ = extract_final(loc_pred) if gen_mode in {"reason", "r1d"} else (loc_pred, "")
+                loc_final, _ = extract_final(loc_pred) if gen_mode in THINKING_GEN_MODES else (loc_pred, "")
                 loc_hit = None
                 if not no_judge and judge_manager is not None and loc_final:
                     _ensure_judge_loaded()
@@ -1243,7 +1271,7 @@ def run_rledit_case(
             "rewrite_hit": int(rewrite_hit_after) if rewrite_hit_after is not None else None,
             "easyedit_metrics": {"rledit_epochs": epochs},
         }
-        if gen_mode in {"reason", "r1d"}:
+        if gen_mode in THINKING_GEN_MODES:
             if final_short_after:
                 rec["final_after"] = final_short_after
             if reasoning_after:
@@ -1262,7 +1290,7 @@ def run_rledit_case(
                 rec["llm_judge_before"] = int(llm_judge_before)
             if answer_match_before is not None:
                 rec["answer_match_before"] = int(answer_match_before)
-            if gen_mode in {"reason", "r1d"}:
+            if gen_mode in THINKING_GEN_MODES:
                 if final_short_before:
                     rec["final_before"] = final_short_before
                 if reasoning_before:
@@ -1407,6 +1435,9 @@ def build_editor(alg: str, hparams_path: str, model_name: str) -> BaseEditor:
     return BaseEditor.from_hparams(hp)
 
 # ===================== 生成（两种模式） =====================
+THINKING_GEN_MODES = {"reason", "r1d", "qwen3"}
+
+
 def _build_messages(prompt: str, mode: str) -> list:
     if mode == "reason":
         sys_msg = (
@@ -1420,6 +1451,11 @@ def _build_messages(prompt: str, mode: str) -> list:
     elif mode == "r1d":
         # DeepSeek-R1-Distill：只提供 user 消息，严格依赖 tokenizer.chat_template
         # 不额外注入任何 prompt/指令，由模板在 add_generation_prompt=True 时自动前置 <think>。
+        return [
+            {"role": "user", "content": prompt}
+        ]
+    elif mode == "qwen3":
+        # Qwen3 默认 chat_template 自带思考段：保持最简 user 输入，由模板控制 <think>。
         return [
             {"role": "user", "content": prompt}
         ]
@@ -1441,9 +1477,22 @@ def generate_answer(model, tokenizer, prompt: str,
     else:
         messages = _build_messages(prompt, mode=mode)
         if hasattr(tokenizer, "apply_chat_template"):
-            # 对 DeepSeek-R1-Distill，必须开启 add_generation_prompt 以触发模板自动插入 <think>
-            add_gen = True if mode == "r1d" else False
-            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_gen)
+            # R1D/Qwen3：必须开启 add_generation_prompt；Qwen3 额外传入 enable_thinking。
+            add_gen = mode in {"r1d", "qwen3"}
+            template_kwargs = {
+                "tokenize": False,
+                "add_generation_prompt": add_gen,
+            }
+            if mode == "qwen3":
+                template_kwargs["enable_thinking"] = True
+            try:
+                text = tokenizer.apply_chat_template(messages, **template_kwargs)
+            except TypeError as exc:
+                if mode == "qwen3" and "enable_thinking" in str(exc):
+                    template_kwargs.pop("enable_thinking", None)
+                    text = tokenizer.apply_chat_template(messages, **template_kwargs)
+                else:
+                    raise
         else:
             if mode == "reason":
                 text = (
@@ -1497,7 +1546,7 @@ def generate_answer(model, tokenizer, prompt: str,
             eos_token_id=eos_ids[0] if len(eos_ids) == 1 else eos_ids,
             pad_token_id=tokenizer.pad_token_id,
             no_repeat_ngram_size=3,
-            repetition_penalty=(1.07 if mode in {"reason", "r1d"} else 1.0),
+            repetition_penalty=(1.07 if mode in THINKING_GEN_MODES else 1.0),
             stopping_criteria=stopping_criteria,
         )
     gen_txt = tokenizer.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
@@ -1632,6 +1681,7 @@ def run_one_case(
     stage: str = "full",
     load_edited_from: str = "",
     train_ds: Optional[List[Dict[str, Any]]] = None,
+    append_eos_target: bool = False,
 ) -> Dict[str, Any]:
     if alg.upper() == "RLEDIT":
         return run_rledit_case(
@@ -1770,6 +1820,10 @@ def run_one_case(
         if isinstance(model_for_edit, nn.Module) and tok_for_edit is not None:
             ensure_tokenizer_model_vocab_alignment(tok_for_edit, model_for_edit, context="[editor]")
 
+        # 可选：在 target_new 末尾补充 eos_token
+        if do_edit and tok_for_edit is not None:
+            req = _maybe_append_eos_to_target(req, tok_for_edit, enable=bool(append_eos_target))
+
         # 安装 Linear 安全前置钩子，避免 cublasLt Matmul 在窄层上崩溃
         try:
             if isinstance(model_for_edit, nn.Module):
@@ -1818,7 +1872,7 @@ def run_one_case(
                     top_p=top_p,
                     mode=gen_mode,
                 )
-                if gen_mode in {"reason", "r1d"}:
+                if gen_mode in THINKING_GEN_MODES:
                     final_b, _ = extract_final(pred_before)
                     a_for_score_before = final_b if final_b else pred_before
                 else:
@@ -2151,7 +2205,7 @@ def run_one_case(
             top_p=top_p,
             mode=gen_mode,
         )
-        if gen_mode in {"reason", "r1d"}:
+        if gen_mode in THINKING_GEN_MODES:
             final_after, _ = extract_final(pred_after)
             a_for_score_after = final_after if final_after else pred_after
         else:
@@ -2200,7 +2254,7 @@ def run_one_case(
                     top_p=top_p,
                     mode=gen_mode,
                 )
-                loc_final, _ = extract_final(loc_pred) if gen_mode in {"reason", "r1d"} else (loc_pred, "")
+                loc_final, _ = extract_final(loc_pred) if gen_mode in THINKING_GEN_MODES else (loc_pred, "")
                 if dist_rank == 0 and not no_judge:
                     _ensure_judge_loaded()
                 loc_hit = (
@@ -2231,7 +2285,7 @@ def run_one_case(
                 rec["case_id"] = req["memit_bundle"][0].get("case_id", "")  # type: ignore[index]
             except Exception:
                 pass
-        if gen_mode in {"reason", "r1d"}:
+        if gen_mode in THINKING_GEN_MODES:
             fa, rs = extract_final(pred_after)
             if fa:
                 rec["final_after"] = fa
@@ -2251,7 +2305,7 @@ def run_one_case(
                 rec["llm_judge_before"] = int(llm_judge_before)
             if answer_match_before is not None:
                 rec["answer_match_before"] = int(answer_match_before)
-            if gen_mode in {"reason", "r1d"}:
+            if gen_mode in THINKING_GEN_MODES:
                 fb, rb = extract_final(pred_before)
                 if fb:
                     rec["final_before"] = fb
@@ -2323,7 +2377,7 @@ def main():
     ap.add_argument("--no_judge", action="store_true", help="跳过全部裁判打分与加载，仅进行编辑与生成")
 
     # 生成控制
-    ap.add_argument("--gen_mode", choices=["concise","reason","noprompt","r1d"], default="concise")
+    ap.add_argument("--gen_mode", choices=["concise","reason","noprompt","r1d","qwen3"], default="qwen3")
     ap.add_argument("--max_new_tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top_p", type=float, default=1.0)
@@ -2361,6 +2415,7 @@ def main():
     ap.add_argument("--anchors_jsonl", default="", help="Path to MEMIT anchors JSONL (from scripts/cot_to_memit_anchors.py)")
     ap.add_argument("--anchors_case_id", default="", help="Case id to pick from anchors JSONL")
     ap.add_argument("--anchors_take", type=int, default=6, help="Max anchors to take for one MEMIT update")
+    ap.add_argument("--append_eos_target", action="store_true", help="在 target_new 末尾补充 tokenizer.eos_token（若缺失）")
 
     args = ap.parse_args()
 
@@ -2550,6 +2605,7 @@ def main():
                 stage=args.stage,
                 load_edited_from=args.load_edited_from,
                 train_ds=train_ds,
+                append_eos_target=bool(args.append_eos_target),
             )
             rec["case_index"] = idx
         except Exception as e:
