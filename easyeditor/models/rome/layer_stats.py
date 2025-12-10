@@ -95,122 +95,14 @@ def layer_stats(
     """
 
     def get_ds():
-        # Strict mode: do NOT perform any fallback. If loading fails, raise immediately.
-        if os.getenv("NO_DATASET_FALLBACK", "0") == "1":
-            default_cfg = dict(wikitext="wikitext-103-raw-v1", wikipedia="20231101.en")
-            repo = ds_name
-            config = default_cfg[ds_name]
-            if ds_name == "wikipedia":
-                repo = os.getenv("WIKI_DATASET", repo)
-                config = os.getenv("WIKI_CONFIG", config)
-            # Some wikipedia configs require Apache Beam runner. Allow specifying it via env.
-            # Example: export WIKI_BEAM_RUNNER=DirectRunner
-            beam_runner = os.getenv("WIKI_BEAM_RUNNER", None)
-            if beam_runner:
-                raw_ds = load_dataset(repo, config, beam_runner=beam_runner)
-            else:
-                raw_ds = load_dataset(repo, config)
-            # determine maxlen
-            if hasattr(model.config, 'n_positions'):
-                maxlen = model.config.n_positions
-            elif hasattr(model.config, 'max_sequence_length'):
-                maxlen = model.config.max_sequence_length
-            elif hasattr(model.config, 'max_position_embeddings'):
-                maxlen = model.config.max_position_embeddings
-            elif hasattr(model.config,'seq_length'):
-                maxlen = model.config.seq_length
-            else:
-                raise NotImplementedError
-            if hasattr(model.config, 'model_type') and 'mistral' in model.config.model_type:
-                if hasattr(model.config, 'sliding_window') and model.config.sliding_window:
-                    maxlen = model.config.sliding_window or 4096
-                else:
-                    maxlen = 4096
-            if hasattr(model.config, 'model_type') and 'qwen2' in model.config.model_type:
-                maxlen = 4096
-            if batch_tokens is not None and batch_tokens < maxlen:
-                maxlen = batch_tokens
-            return TokenizedDataset(raw_ds["train"], tokenizer, maxlen=maxlen)
-
-        # Fast offline path: allow env to force a tiny synthetic dataset, avoiding any network.
-        # Triggers when USE_SYNTHETIC_STATS=1 or HF_DATASETS_OFFLINE=1.
-        if os.getenv("USE_SYNTHETIC_STATS", "0") == "1" or os.getenv("HF_DATASETS_OFFLINE", "0") == "1":
-            try:
-                from datasets import Dataset, DatasetDict
-                texts = [
-                    "This is a tiny fallback corpus for offline covariance stats.",
-                    "It contains a few short sentences to stabilize AlphaEdit.",
-                    "Replace it with real data if available.",
-                ] * 5000
-                raw_ds = DatasetDict({"train": Dataset.from_dict({"text": texts})})
-                print("[layer_stats] Using synthetic offline dataset due to env flag.")
-                # Determine maxlen based on model config (same as below)
-                if hasattr(model.config, 'n_positions'):
-                    maxlen = model.config.n_positions
-                elif hasattr(model.config, 'max_sequence_length'):
-                    maxlen = model.config.max_sequence_length
-                elif hasattr(model.config, 'max_position_embeddings'):
-                    maxlen = model.config.max_position_embeddings
-                elif hasattr(model.config,'seq_length'):
-                    maxlen = model.config.seq_length
-                else:
-                    raise NotImplementedError
-                if hasattr(model.config, 'model_type') and 'mistral' in model.config.model_type:
-                    if hasattr(model.config, 'sliding_window') and model.config.sliding_window:
-                        maxlen = model.config.sliding_window or 4096
-                    else:
-                        maxlen = 4096
-                if hasattr(model.config, 'model_type') and 'qwen2' in model.config.model_type:
-                    maxlen = 4096
-                if batch_tokens is not None and batch_tokens < maxlen:
-                    maxlen = batch_tokens
-                return TokenizedDataset(raw_ds["train"], tokenizer, maxlen=maxlen)
-            except Exception:
-                # Fall through to standard path if synthetic construction fails
-                pass
         # Load_From_File
         # from datasets import Dataset
         # raw_ds = Dataset.from_file('XXX/XXX/wikipedia-train.arrow')
         # raw_ds = {'train': raw_ds}
-        # Support environment overrides for Wikipedia under datasets>=3.
-        default_cfg = dict(wikitext="wikitext-103-raw-v1", wikipedia="20231101.en")
-        repo = ds_name
-        config = default_cfg[ds_name]
-        if ds_name == "wikipedia":
-            repo = os.getenv("WIKI_DATASET", repo)
-            config = os.getenv("WIKI_CONFIG", config)
-        try:
-            raw_ds = load_dataset(repo, config)
-        except Exception:
-            # Robust fallbacks for Wikipedia under different datasets versions / mirrors
-            if ds_name == "wikipedia":
-                # 1) Try the new repository name
-                try:
-                    fallback_repo = "wikimedia/wikipedia"
-                    fallback_cfg = os.getenv("WIKI_CONFIG", "20231101.en")
-                    raw_ds = load_dataset(fallback_repo, fallback_cfg)
-                except Exception:
-                    # 2) Fall back to wikitext (widely available) to unblock stats collection
-                    try:
-                        raw_ds = load_dataset("wikitext", "wikitext-103-raw-v1")
-                    except Exception:
-                        # 3) As a last resort, synthesize a tiny local dataset to unblock editing
-                        try:
-                            from datasets import Dataset, DatasetDict
-                            texts = [
-                                "This is a tiny fallback corpus for offline covariance stats.",
-                                "It contains a few short sentences to stabilize AlphaEdit.",
-                                "Replace it with real data if available.",
-                            ] * 5000
-                            raw_ds = DatasetDict({"train": Dataset.from_dict({"text": texts})})
-                            print("[layer_stats] Falling back to a tiny synthetic dataset (offline mode).")
-                        except Exception as final_err:
-                            raise RuntimeError(
-                                "Failed to load Wikipedia and wikitext; and also failed to create a fallback dataset. "
-                                "You can set env WIKI_DATASET/WIKI_CONFIG to override, or pre-download a local dataset."
-                            ) from final_err
-                else:
-                    raise
+        raw_ds = load_dataset(
+            ds_name,
+            dict(wikitext="wikitext-103-raw-v1", wikipedia="20200501.en")[ds_name]
+        )
         if hasattr(model.config, 'n_positions'):
             maxlen = model.config.n_positions
         elif hasattr(model.config, 'max_sequence_length'):

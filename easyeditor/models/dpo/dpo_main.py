@@ -2,7 +2,6 @@ from copy import deepcopy
 from typing import Any, Dict, List, Tuple
 from peft import get_peft_model, AdaLoraConfig, TaskType, get_peft_model_state_dict, set_peft_model_state_dict, LoraConfig
 import torch
-import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .dpo_hparams import DPOHyperParams
@@ -98,78 +97,56 @@ def execute_dpo(
         ):
             mask_token = -100
             opt.zero_grad()
-            # Build inputs for positive samples (mask prompt tokens; only predict target part)
-            full_pos = [f"{p} {t}" for p, t in zip(txt_batch, tgt_pos_batch)]
-            sent_pos = tok(full_pos, return_tensors="pt", padding=True, truncation=True)
-            targ_pos = tok(tgt_pos_batch, return_tensors="pt", padding=True, truncation=True)
-            labels_pos = sent_pos["input_ids"].clone()
-            for i in range(labels_pos.size(0)):
-                tgt_len = int(targ_pos["attention_mask"][i].sum().item())
-                pad_len = int(sent_pos["input_ids"].size(1) - sent_pos["attention_mask"][i].sum().item())
-                if tgt_len + pad_len < labels_pos.size(1):
-                    labels_pos[i, : labels_pos.size(1) - tgt_len - pad_len] = mask_token
-                labels_pos[i, labels_pos[i] == tok.pad_token_id] = mask_token
-            sent_pos = {**sent_pos, "labels": labels_pos}
-            sent_pos = {k: v.to(device) for k, v in sent_pos.items()}
+
+            # Build inputs for positive samples
+            full_prompt_pos = [f"{p} {l}" for p, l in zip(txt_batch, tgt_pos_batch)]
+            tokens_pos = tok(full_prompt_pos, return_tensors="pt", padding=True, truncation=True)
+            tokens_pos["labels"] = tokens_pos["input_ids"].clone()
+            tokens_pos["labels"][tokens_pos["input_ids"] == tok.pad_token_id] = mask_token
+            tokens_pos = tokens_pos.to(device)
 
             # Build inputs for negative samples
-            full_neg = [f"{p} {t}" for p, t in zip(txt_batch, tgt_neg_batch)]
-            sent_neg = tok(full_neg, return_tensors="pt", padding=True, truncation=True)
-            targ_neg = tok(tgt_neg_batch, return_tensors="pt", padding=True, truncation=True)
-            labels_neg = sent_neg["input_ids"].clone()
-            for i in range(labels_neg.size(0)):
-                tgt_len = int(targ_neg["attention_mask"][i].sum().item())
-                pad_len = int(sent_neg["input_ids"].size(1) - sent_neg["attention_mask"][i].sum().item())
-                if tgt_len + pad_len < labels_neg.size(1):
-                    labels_neg[i, : labels_neg.size(1) - tgt_len - pad_len] = mask_token
-                labels_neg[i, labels_neg[i] == tok.pad_token_id] = mask_token
-            sent_neg = {**sent_neg, "labels": labels_neg}
-            sent_neg = {k: v.to(device) for k, v in sent_neg.items()}
+            full_prompt_neg = [f"{p} {l}" for p, l in zip(txt_batch, tgt_neg_batch)]
+            tokens_neg = tok(full_prompt_neg, return_tensors="pt", padding=True, truncation=True)
+            tokens_neg["labels"] = tokens_neg["input_ids"].clone()
+            tokens_neg["labels"][tokens_neg["input_ids"] == tok.pad_token_id] = mask_token
+            tokens_neg = tokens_neg.to(device)
 
-            # Forward policy (LoRA-enabled)
-            outputs_pos = peft_model(**sent_pos)
-            outputs_neg = peft_model(**sent_neg)
+            # Compute outputs with LoRA modules (current model)
+            outputs_pos = peft_model(**tokens_pos)
+            outputs_neg = peft_model(**tokens_neg)
 
-            # Reference model: disable LoRA adapters
-            peft_model.eval()
-            peft_model.disable_adapter_layers()
+            # Compute outputs for the reference model (disable LoRA modules)
+            peft_model.eval()  # Switch to evaluation mode
+            peft_model.disable_adapter_layers()  # Disable LoRA layers
+
             with torch.no_grad():
-                ref_outputs_pos = peft_model(**sent_pos)
-                ref_outputs_neg = peft_model(**sent_neg)
-            peft_model.train()
-            peft_model.enable_adapter_layers()
+                ref_outputs_pos = peft_model(**tokens_pos)
+                ref_outputs_neg = peft_model(**tokens_neg)
 
-            # Helper to compute sequence log-prob sum over non-masked labels (teacher forcing)
-            def seq_logp_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-                shift_logits = logits[:, :-1, :]
-                shift_labels = labels[:, 1:]
-                # mask positions where labels are valid
-                mask = (shift_labels != mask_token).to(shift_logits.dtype)
-                logp = F.log_softmax(shift_logits, dim=-1)
-                # replace masked labels to zero index to avoid gather errors
-                safe_labels = torch.where(shift_labels >= 0, shift_labels, torch.zeros_like(shift_labels))
-                picked = logp.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
-                return (picked * mask).sum(dim=1)
+            peft_model.train()  # Switch back to training mode
+            peft_model.enable_adapter_layers()  # Enable LoRA layers
 
-            policy_pos = seq_logp_sum(outputs_pos.logits, labels_pos)
-            policy_neg = seq_logp_sum(outputs_neg.logits, labels_neg)
-            ref_pos = seq_logp_sum(ref_outputs_pos.logits, labels_pos)
-            ref_neg = seq_logp_sum(ref_outputs_neg.logits, labels_neg)
-
-            beta = hparams.beta
-            dpo_advantage = beta * ((policy_pos - policy_neg) - (ref_pos - ref_neg))
-            dpo_loss = (-F.logsigmoid(dpo_advantage)).mean()
-
-            # Optional CE on positive to stabilize
+            # Compute losses
             lora_loss = outputs_pos.loss
-            loss = hparams.alpha * lora_loss + (1.0 - hparams.alpha) * dpo_loss
+            beta = hparams.beta
+
+            ref_log_probs_pos = ref_outputs_pos.logits.log_softmax(-1)
+            ref_log_probs_neg = ref_outputs_neg.logits.log_softmax(-1)
+
+            log_probs_pos = outputs_pos.logits.log_softmax(-1)
+            log_probs_neg = outputs_neg.logits.log_softmax(-1)
+
+            dpo_advantage = beta * (
+                (log_probs_pos - ref_log_probs_pos).sum(-1) -
+                (log_probs_neg - ref_log_probs_neg).sum(-1)
+            )
+            dpo_loss = -torch.mean(torch.log(torch.sigmoid(dpo_advantage)))
+
+            # Total loss
+            loss = hparams.alpha * lora_loss + (1 - hparams.alpha) * dpo_loss
 
             loss.backward()
-            # Stabilize training for single-sample updates
-            try:
-                torch.nn.utils.clip_grad_norm_(peft_model.parameters(), max_norm=1.0)
-            except Exception:
-                pass
             opt.step()
 
             bs = len(txt_batch)
